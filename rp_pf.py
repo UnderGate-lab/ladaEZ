@@ -62,7 +62,7 @@ class SettingsDialog(QDialog):
         layout.addRow("キューサイズ:", self.queue_size_spin)
         
         self.clip_length_spin = QSpinBox()
-        self.clip_length_spin.setRange(6, 48)
+        self.clip_length_spin.setRange(1, 48)
         self.clip_length_spin.setValue(self.settings.get('max_clip_length', 12))
         self.clip_length_spin.setSuffix(" frames")
         layout.addRow("最大クリップ長:", self.clip_length_spin)
