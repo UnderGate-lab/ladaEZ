@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LADA REALTIME PLAYER V0.9
+LADA Windows V1.0 - 30FPS最適化版
 フルスクリーン進捗バー + 設定機能 + 再生速度制御 + 音声機能追加
 """
 
@@ -14,7 +14,7 @@ from collections import OrderedDict
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QProgressBar, QTextEdit,
-    QDialog, QSpinBox, QFormLayout, QDialogButtonBox, QSlider, QSizePolicy
+    QDialog, QSpinBox, QFormLayout, QDialogButtonBox, QSlider
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QMutex, QMutexLocker, QTimer, QPoint
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
@@ -159,8 +159,6 @@ class VideoGLWidget(QOpenGLWidget):
     playback_toggled = pyqtSignal()
     video_dropped = pyqtSignal(str)
     seek_requested = pyqtSignal(int)
-    toggle_mute_signal = pyqtSignal()  # 追加: ミュートトグルシグナル
-    toggle_ai_processing_signal = pyqtSignal()  # 追加: AI処理トグルシグナル
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -372,19 +370,8 @@ class VideoGLWidget(QOpenGLWidget):
                     if isinstance(widget, QMainWindow) and hasattr(widget, 'seek_relative'):
                         widget.seek_relative(-30)
                         break
-            elif key == Qt.Key.Key_M:  # 追加: Mキーでミュートトグル
-                self.toggle_mute_signal.emit()
-            elif key == Qt.Key.Key_X:  # 追加: XキーでAI処理トグル
-                self.toggle_ai_processing_signal.emit()
         else:
-            # 通常画面でもショートカットを処理
-            key = event.key()
-            if key == Qt.Key.Key_M:  # 追加: Mキーでミュートトグル
-                self.toggle_mute_signal.emit()
-            elif key == Qt.Key.Key_X:  # 追加: XキーでAI処理トグル
-                self.toggle_ai_processing_signal.emit()
-            else:
-                super().keyPressEvent(event)
+            super().keyPressEvent(event)
     
     def mouseDoubleClickEvent(self, event):
         """ダブルクリックでフルスクリーン切り替え - 再生状態を保持"""
@@ -1068,10 +1055,8 @@ class AudioThread(QThread):
         print(f"[DEBUG] ユーザーミュート設定: {is_muted}")
 
     def stop(self):
-        """スレッド停止"""
         self._stop_flag = True
         self.stop_playback()
-        # super().stop() を削除 - これは不要です
 
 class LadaFinalPlayer(QMainWindow):
     def __init__(self):
@@ -1091,7 +1076,6 @@ class LadaFinalPlayer(QMainWindow):
         self.is_paused = False
         self.thread_counter = 0
         self._seeking = False
-        self.ai_processing_enabled = True
         
         # VLCの初期化
         self.vlc_instance = vlc.Instance('--no-video') if VLC_AVAILABLE else None
@@ -1112,42 +1096,9 @@ class LadaFinalPlayer(QMainWindow):
         self.stats_timer.start(1000)
         
         self.init_ui()
-
-    def load_settings(self):
-        if CONFIG_FILE.exists():
-            try:
-                with open(CONFIG_FILE, 'r') as f:
-                    settings = json.load(f)
-                    print(f"[INFO] 設定読み込み: 音量={settings.get('audio_volume')}, ミュート={settings.get('audio_muted')}")
-                    return settings
-            except:
-                pass
-        
-        return {
-            'batch_size': 16,
-            'queue_size_mb': 12288,
-            'max_clip_length': 8,
-            'cache_size_mb': 12288,
-            'audio_volume': 100, 
-            'audio_muted': False
-        }
-
-    def save_settings(self):
-        if self.audio_thread:
-            # 現在の音量を保存（ミュート中でない場合）
-            if not self.audio_thread.user_muted:
-                self.settings['audio_volume'] = self.audio_thread.volume
-            self.settings['audio_muted'] = self.audio_thread.user_muted
-            
-        try:
-            with open(CONFIG_FILE, 'w') as f:
-                json.dump(self.settings, f, indent=2)
-            print(f"[INFO] 設定保存: 音量={self.settings.get('audio_volume')}, ミュート={self.settings.get('audio_muted')}")
-        except Exception as e:
-            print(f"[ERROR] 設定保存失敗: {e}")
-
+    
     def init_ui(self):
-        self.setWindowTitle("LADA REALTIME PLAYER V0.9")
+        self.setWindowTitle("LADA REALTIME PLAYER V1.0")
         self.setGeometry(100, 100, 1200, 850)
         
         central = QWidget()
@@ -1175,8 +1126,6 @@ class LadaFinalPlayer(QMainWindow):
         self.video_widget.playback_toggled.connect(self.toggle_playback)
         self.video_widget.video_dropped.connect(self.load_video)
         self.video_widget.seek_requested.connect(self.seek_to_frame)
-        self.video_widget.toggle_mute_signal.connect(self.toggle_mute_shortcut)
-        self.video_widget.toggle_ai_processing_signal.connect(self.toggle_ai_processing)
         self.video_layout.addWidget(self.video_widget)
         layout.addLayout(self.video_layout)
         
@@ -1185,22 +1134,16 @@ class LadaFinalPlayer(QMainWindow):
         self.progress_bar.mousePressEvent = self.seek_click
         layout.addWidget(self.progress_bar)
         
+        # 再生時間表示とボリュームコントロールのレイアウト
         time_audio_layout = QHBoxLayout()
         
+        # 再生時間表示 (センター寄せ)
         self.time_label = QLabel("00:00:00 / 00:00:00")
         self.time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.time_label.setStyleSheet("""
-            QLabel {
-                font-size: 12px; 
-                color: #aaa;
-                background-color: rgba(40, 40, 40, 150);
-                padding: 2px 8px;
-                border-radius: 4px;
-                min-width: 150px;
-            }
-        """)
+        self.time_label.setStyleSheet("font-size: 12px; color: #aaa;")
         self.time_label.setMaximumHeight(20)
         
+        # ボリュームコントロール (右寄せ)
         self.mute_btn = QPushButton("🔇")
         self.mute_btn.setCheckable(True)
         self.mute_btn.setChecked(self.settings.get('audio_muted', False))
@@ -1209,6 +1152,7 @@ class LadaFinalPlayer(QMainWindow):
         
         self.volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.volume_slider.setRange(0, 100)
+        # 修正: 設定ファイルの値がfloat (例: 0.7) の場合に 0-100 の整数値に変換してUIに反映
         initial_volume_ui = self.settings.get('audio_volume', 100)
         if isinstance(initial_volume_ui, float):
              initial_volume_ui = int(initial_volume_ui * 100)
@@ -1220,13 +1164,11 @@ class LadaFinalPlayer(QMainWindow):
         
         time_audio_layout.addStretch(1)
         time_audio_layout.addWidget(self.time_label)
+        time_audio_layout.addStretch(1)
         
         if VLC_AVAILABLE:
-            time_audio_layout.addStretch(1)
             time_audio_layout.addWidget(self.mute_btn)
             time_audio_layout.addWidget(self.volume_slider)
-        else:
-            time_audio_layout.addStretch(1)
         
         layout.addLayout(time_audio_layout)
         
@@ -1242,15 +1184,9 @@ class LadaFinalPlayer(QMainWindow):
         self.settings_btn = QPushButton("⚙️ 設定")
         self.settings_btn.clicked.connect(self.open_settings)
         
-        self.ai_toggle_btn = QPushButton("🤖 AI: ON")
-        self.ai_toggle_btn.setCheckable(True)
-        self.ai_toggle_btn.setChecked(True)
-        self.ai_toggle_btn.clicked.connect(self.toggle_ai_processing)
-        
         btn_layout.addWidget(self.open_btn)
         btn_layout.addWidget(self.play_pause_btn)
         btn_layout.addWidget(self.settings_btn)
-        btn_layout.addWidget(self.ai_toggle_btn)
         layout.addLayout(btn_layout)
         
         stats_layout = QHBoxLayout()
@@ -1270,8 +1206,8 @@ class LadaFinalPlayer(QMainWindow):
         info.setReadOnly(True)
         info.setMaximumHeight(100)
         info.setText("""
-V0.9 - 30FPS最適化: 
-操作: F=全画面 | ESC=通常 | Space=再生/停止 | M=ミュートトグル | X=AI処理トグル | 進捗バークリックでシーク
+V1.0 - 30FPS最適化: フルスクリーン進捗バー + 設定機能 + 再生速度制御 + 音声機能追加
+操作: F=全画面 | ESC=通常 | Space=再生/停止 | ⚙️設定で性能調整 | 進捗バークリックでシーク
 最適化: バッチ16, キュー12GB, クリップ長8 で30FPS目標
 """)
         layout.addWidget(info)
@@ -1279,7 +1215,9 @@ V0.9 - 30FPS最適化:
         self.setup_shortcuts()
         print("[INFO] 初期化完了 - 30FPS最適化版")
         
+        # UI初期化後に音声設定をAudioThreadに適用
         if self.audio_thread:
+            # AudioThreadに渡すのは0-100の整数値
             initial_volume_thread = self.settings.get('audio_volume', 100)
             if isinstance(initial_volume_thread, float):
                  initial_volume_thread = int(initial_volume_thread * 100)
@@ -1288,7 +1226,7 @@ V0.9 - 30FPS最適化:
             self.audio_thread.set_volume(initial_volume_thread)
             self.audio_thread.toggle_mute(self.settings.get('audio_muted', False))
             self.mute_btn.setText("🔇" if self.settings.get('audio_muted', False) else "🔊")
-
+    
     def setup_shortcuts(self):
         self.shortcut_fullscreen = QShortcut(QKeySequence('F'), self)
         self.shortcut_fullscreen.activated.connect(self.toggle_fullscreen_shortcut)
@@ -1314,128 +1252,23 @@ V0.9 - 30FPS最適化:
         self.shortcut_k = QShortcut(QKeySequence('K'), self)
         self.shortcut_k.activated.connect(self.toggle_playback)
         
-        self.shortcut_mute = QShortcut(QKeySequence('M'), self)
-        self.shortcut_mute.activated.connect(self.toggle_mute_shortcut)
-        
-        self.shortcut_ai_toggle = QShortcut(QKeySequence('X'), self)
-        self.shortcut_ai_toggle.activated.connect(self.toggle_ai_processing)
-        
         print("[INFO] ショートカット設定完了")
-
-    def toggle_mute_shortcut(self):
-        """Mキーでのミュートトグル - 音量復元を修正"""
-        if self.audio_thread:
-            new_mute_state = not self.audio_thread.user_muted
-            self.audio_thread.toggle_mute(new_mute_state)
-            self.mute_btn.setChecked(new_mute_state)
-            self.mute_btn.setText("🔇" if new_mute_state else "🔊")
-            
-            if new_mute_state:
-                # ミュート時：現在の音量を保存して0に設定
-                self.settings['last_volume'] = self.audio_thread.volume
-                self.volume_slider.setValue(0)
-                print(f"[DEBUG] ミュートON: 音量{self.settings['last_volume']}を保存")
-            else:
-                # ミュート解除時：保存した音量か設定ファイルの音量を復元
-                unmuted_volume = self.settings.get('last_volume', self.settings.get('audio_volume', 100))
-                if isinstance(unmuted_volume, float):
-                    unmuted_volume = int(unmuted_volume * 100)
-                unmuted_volume = max(1, min(100, unmuted_volume))
-                
-                self.volume_slider.setValue(unmuted_volume)
-                self.audio_thread.set_volume(unmuted_volume)
-                print(f"[DEBUG] ミュートOFF: 音量{unmuted_volume}に復元")
-            
-            self.save_audio_settings()
-            print(f"[DEBUG] ミュートトグル: {'ON' if new_mute_state else 'OFF'}")
-
-    def toggle_user_mute(self, checked):
-        """ユーザーによるミュート切り替え - 音量復元を修正"""
-        if self.audio_thread:
-            self.audio_thread.toggle_mute(checked)
-            self.mute_btn.setText("🔇" if checked else "🔊")
-            
-            if checked:
-                # ミュート時：現在の音量を保存
-                self.settings['last_volume'] = self.audio_thread.volume
-                self.volume_slider.setValue(0)
-                print(f"[DEBUG] ミュートON(ボタン): 音量{self.settings['last_volume']}を保存")
-            else:
-                # ミュート解除時：保存した音量を復元
-                unmuted_volume = self.settings.get('last_volume', self.settings.get('audio_volume', 100))
-                if isinstance(unmuted_volume, float):
-                    unmuted_volume = int(unmuted_volume * 100)
-                unmuted_volume = max(1, min(100, unmuted_volume))
-                
-                self.volume_slider.setValue(unmuted_volume)
-                self.audio_thread.set_volume(unmuted_volume)
-                print(f"[DEBUG] ミュートOFF(ボタン): 音量{unmuted_volume}に復元")
-            
-            self.save_audio_settings()
-
-    def set_volume_slider(self, value):
-        """ボリュームスライダー操作時 - ミュート状態を考慮"""
-        if self.audio_thread:
-            self.audio_thread.set_volume(value)
-            
-            # 音量が0より大きい場合はミュート解除
-            if value > 0 and self.audio_thread.user_muted:
-                self.audio_thread.toggle_mute(False)
-                self.mute_btn.setChecked(False)
-                self.mute_btn.setText("🔊")
-                print(f"[DEBUG] スライダー操作でミュート解除: 音量{value}")
-            
-            # 現在の音量を設定に保存（ミュート解除用）
-            self.settings['audio_volume'] = value
-            self.save_audio_settings()
-
-    def toggle_ai_processing(self):
-        """XキーでのAI処理トグル - 確実に切り替え"""
-        self.ai_processing_enabled = not self.ai_processing_enabled
-        
-        if self.ai_processing_enabled:
-            self.ai_toggle_btn.setText("🤖 AI: ON")
-            self.ai_toggle_btn.setChecked(True)
-            self.mode_label.setText("📊 モード: 🔄 AI処理有効")
-            print("[DEBUG] AI処理: 有効")
-        else:
-            self.ai_toggle_btn.setText("🎥 原画: ON")
-            self.ai_toggle_btn.setChecked(False)
-            self.mode_label.setText("📊 モード: 🎥 原画再生")
-            print("[DEBUG] AI処理: 無効 (原画再生)")
-        
-        # 現在再生中の場合は完全に停止してから再開
-        if self.current_video:
-            current_frame = self.current_frame
-            print(f"[DEBUG] モード切替: フレーム{current_frame}から再開")
-            
-            # 完全停止
-            self.full_stop()
-            
-            # 状態をリセット
-            self.is_playing = False
-            self.is_paused = False
-            
-            QApplication.processEvents()
-            time.sleep(0.2)  # 確実に停止するまで待機
-            
-            # 新しいモードで再生開始
-            self.start_processing_from_frame(current_frame)
-
+    
     def dragEnterEvent(self, event: QDragEnterEvent):
+        """メインウィンドウでもD&Dをサポート"""
         if event.mimeData().hasUrls():
             urls = event.mimeData().urls()
             if urls:
                 file_path = urls[0].toLocalFile()
                 if self.is_video_file(file_path):
                     event.acceptProposedAction()
-
+    
     def dragMoveEvent(self, event):
         if event.mimeData().hasUrls():
             urls = event.mimeData().urls()
             if urls and self.is_video_file(urls[0].toLocalFile()):
                 event.acceptProposedAction()
-
+    
     def dropEvent(self, event: QDropEvent):
         urls = event.mimeData().urls()
         if urls:
@@ -1444,22 +1277,255 @@ V0.9 - 30FPS最適化:
                 print(f"[DEBUG] メインウィンドウD&D: {file_path}")
                 self.load_video(file_path)
                 event.acceptProposedAction()
-
+    
     def is_video_file(self, file_path):
+        """動画ファイルかどうかを判定"""
         video_extensions = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.ts']
         file_ext = Path(file_path).suffix.lower()
         return file_ext in video_extensions
+    
+    def load_settings(self):
+        if CONFIG_FILE.exists():
+            try:
+                with open(CONFIG_FILE, 'r') as f:
+                    settings = json.load(f)
+                    print(f"[INFO] 設定読み込み: {settings}")
+                    return settings
+            except:
+                pass
+        
+        # 30FPS達成に向けた最適化設定
+        return {
+            'batch_size': 16,  # 16フレームに調整
+            'queue_size_mb': 12288,  # 12GBに増加
+            'max_clip_length': 8,    # クリップ長を短く
+            'cache_size_mb': 12288,  # 12GBに増加
+            'audio_volume': 100, 
+            'audio_muted': False
+        }
+    
+    def save_settings(self):
+        # 音声設定も保存
+        if self.audio_thread:
+            # 0-100 の整数で保存
+            self.settings['audio_volume'] = self.audio_thread.volume
+            self.settings['audio_muted'] = self.audio_thread.user_muted
+            
+        try:
+            with open(CONFIG_FILE, 'w') as f:
+                json.dump(self.settings, f, indent=2)
+            print(f"[INFO] 設定保存: {self.settings}")
+        except Exception as e:
+            print(f"[ERROR] 設定保存失敗: {e}")
+            
+    def save_audio_settings(self):
+        """ボリューム操作完了後に設定を保存"""
+        self.save_settings()
+    
+    def set_volume_slider(self, value):
+        """ボリュームスライダー操作時"""
+        if self.audio_thread:
+            self.audio_thread.set_volume(value)
+            # ユーザーミュートがONの場合、スライダーを動かしてもミュート状態を維持
+            if self.audio_thread.user_muted:
+                self.mute_btn.setText("🔇")
+                self.mute_btn.setChecked(True)
+            else:
+                self.mute_btn.setText("🔊" if value > 0 else "🔇")
+                self.mute_btn.setChecked(value == 0) # 音量0はミュート扱いとする
+    
+    def toggle_user_mute(self, checked):
+        """ユーザーによるミュート切り替え"""
+        if self.audio_thread:
+            self.audio_thread.toggle_mute(checked)
+            self.mute_btn.setText("🔇" if checked else "🔊")
+            
+            # ミュートした場合、ボリュームスライダーを0に
+            if checked:
+                self.volume_slider.setValue(0)
+            else:
+                # ミュート解除した場合、ミュート前のボリューム（設定に保存されている値）に戻す
+                unmuted_volume = self.settings.get('audio_volume', 100)
+                if isinstance(unmuted_volume, float):
+                     unmuted_volume = int(unmuted_volume * 100)
+                unmuted_volume = max(1, min(100, unmuted_volume)) # 0に戻らないように最低値1
+                
+                self.volume_slider.setValue(unmuted_volume)
+                self.audio_thread.set_volume(unmuted_volume) # VLCに設定
+            
+            self.save_audio_settings() # 保存
+    
+    def open_settings(self):
+        dialog = SettingsDialog(self, self.settings)
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            new_settings = dialog.get_settings()
+            
+            # 音声設定はここで保存しない (volume, muteの状態は別の操作で保存するため)
+            
+            if (new_settings.get('batch_size') != self.settings.get('batch_size') or 
+                new_settings.get('queue_size_mb') != self.settings.get('queue_size_mb') or 
+                new_settings.get('max_clip_length') != self.settings.get('max_clip_length') or
+                new_settings.get('cache_size_mb') != self.settings.get('cache_size_mb')):
+                
+                self.settings.update(new_settings)
+                self.save_settings() # AI処理設定のみを更新し、保存
 
-    def update_stats(self):
-        stats = self.frame_cache.get_stats()
-        self.cache_label.setText(f"💾 キャッシュ: {stats['size_mb']:.1f} MB ({stats['count']} frames)")
-
-    def format_time(self, seconds):
-        h = int(seconds // 3600)
-        m = int((seconds % 3600) // 60)
-        s = int(seconds % 60)
-        return f"{h:02d}:{m:02d}:{s:02d}"
-
+                print("[INFO] 設定変更 - 完全リセット実行")
+                self.full_stop()
+                self.frame_cache = FrameCache(max_size_mb=self.settings['cache_size_mb'])
+                
+                if self.current_video:
+                    self.load_video(self.current_video)
+                
+                print(f"[INFO] 新設定適用完了: {self.settings}")
+            else:
+                # AI処理設定に変更がない場合でも、念のため保存処理を呼び出し
+                self.settings.update(new_settings)
+                self.save_settings()
+    
+    def toggle_fullscreen_shortcut(self):
+        self.video_widget.toggle_fullscreen()
+    
+    def escape_fullscreen_shortcut(self):
+        if self.video_widget.is_fullscreen:
+            self.video_widget.toggle_fullscreen()
+    
+    def seek_click(self, event):
+        if self.total_frames > 0:
+            pos = event.pos().x()
+            width = self.progress_bar.width()
+            target_frame = int((pos / width) * self.total_frames)
+            self.seek_to_frame(target_frame)
+    
+    def seek_to_frame(self, target_frame):
+        if not self.current_video or self._seeking or self.total_frames == 0:
+            return
+        
+        self._seeking = True
+        self.full_stop()
+        QApplication.processEvents()
+        time.sleep(0.1)
+        
+        self.current_frame = target_frame
+        self.progress_bar.setValue(target_frame)
+        self.video_widget.update_progress(target_frame)
+        
+        frame_data = self.frame_cache.get(target_frame)
+        if frame_data is not None:
+            self.video_widget.update_frame(frame_data)
+        
+        # 音声シーク
+        if self.audio_thread:
+            target_sec = target_frame / self.video_fps if self.video_fps > 0 else 0
+            self.audio_thread.seek_to_time(target_sec)
+        
+        self.start_processing_from_frame(target_frame)
+        
+        # seek_to_frameが一時停止状態で行われた場合、再生を再開しない
+        # ProcessThreadのstart_processing_from_frame内で再生が開始される
+        
+        self._seeking = False
+    
+    def open_video(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "動画選択", "", "Videos (*.mp4 *.avi *.mkv *.mov *.wmv *.flv *.webm)"
+        )
+        if path:
+            self.load_video(path)
+    
+    def load_video(self, path):
+        print(f"[INFO] 動画読み込み: {path}")
+        self.full_stop()
+        self.frame_cache.clear()
+        self.video_widget.clear_frame()
+        
+        self.current_video = path
+        
+        fullpath = str(Path(path).resolve())
+        max_length = 100
+        if len(fullpath) > max_length:
+            fullpath = "..." + fullpath[-(max_length-3):]
+        self.filename_label.setText(f"🎬 {fullpath}")
+        self.filename_label.show()
+        
+        if LADA_AVAILABLE:
+            try:
+                video_meta = video_utils.get_video_meta_data(path)
+                self.total_frames = video_meta.frames_count
+                self.video_fps = video_meta.video_fps
+                self.progress_bar.setMaximum(self.total_frames)
+                
+                # VideoGLWidgetに動画情報を設定
+                self.video_widget.set_video_info(self.total_frames, self.video_fps)
+            except Exception as e:
+                print(f"[ERROR] 動画メタデータ取得失敗: {e}")
+                self.total_frames = 0
+                self.video_fps = 30.0
+                pass
+        
+        self.start_processing_from_frame(0)
+        self.mode_label.setText(f"📊 選択: {Path(path).name}")
+    
+    def start_processing(self):
+        self.start_processing_from_frame(0)
+    
+    def start_processing_from_frame(self, start_frame):
+        if not self.current_video or not LADA_AVAILABLE:
+            return
+        
+        if self.process_thread and self.process_thread.isRunning():
+            return
+        
+        model_dir = LADA_BASE_PATH / "model_weights"
+        detection_path = model_dir / "lada_mosaic_detection_model_v3.1_fast.pt"
+        restoration_path = model_dir / "lada_mosaic_restoration_model_generic_v1.2.pth"
+        
+        if not detection_path.exists() or not restoration_path.exists():
+            self.mode_label.setText("エラー: モデルなし")
+            return
+        
+        self.thread_counter += 1
+        current_id = self.thread_counter
+        
+        self.process_thread = ProcessThread(
+            self.current_video, detection_path, restoration_path,
+            self.frame_cache, start_frame, current_id, self.settings,
+            audio_thread=self.audio_thread, video_fps=self.video_fps # AudioThreadとFPSを渡す
+        )
+        
+        self.process_thread.frame_ready.connect(
+            lambda frame, num, cached: self.on_frame_ready(frame, num, cached, current_id)
+        )
+        self.process_thread.fps_updated.connect(
+            lambda fps: self.fps_label.setText(f"⚡ FPS: {fps:.1f}")
+        )
+        self.process_thread.progress_updated.connect(
+            lambda c, t: self.on_progress_update(c, t)
+        )
+        self.process_thread.finished_signal.connect(self.on_processing_finished)
+        
+        self.process_thread.start()
+        self.is_playing = True
+        self.is_paused = False
+        self.play_pause_btn.setEnabled(True)
+        self.play_pause_btn.setText("⏸ 一時停止")
+        self.mode_label.setText("📊 モード: 🔄 AI処理中")
+        # 再生開始時は緑色
+        self.video_widget.set_progress_bar_color('#00ff00')
+    
+    def on_processing_finished(self):
+        """処理完了時の後処理"""
+        print("[INFO] AI処理が完了しました")
+        self.full_stop()
+        self.mode_label.setText("📊 モード: 完了")
+    
+    def on_progress_update(self, current, total):
+        """進捗更新 - 標準画面とフルスクリーン両方"""
+        self.current_frame = current
+        self.progress_bar.setValue(current)
+        self.video_widget.update_progress(current)
+    
     def on_frame_ready(self, frame, frame_num, is_cached, thread_id):
         if self.process_thread and thread_id == self.process_thread.thread_id:
             self.current_frame = frame_num
@@ -1474,39 +1540,82 @@ V0.9 - 30FPS最適化:
             
             if is_cached:
                 self.mode_label.setText("📊 モード: 💾 キャッシュ再生")
+                # キャッシュ再生中は黄色
                 if not self.is_paused:
                     self.video_widget.set_progress_bar_color('yellow')
             else:
                 self.mode_label.setText("📊 モード: 🔄 AI処理中")
+                # AI処理中は緑色
                 if not self.is_paused:
                     self.video_widget.set_progress_bar_color('#00ff00')
-
-    def on_progress_update(self, current, total):
-        self.current_frame = current
-        self.progress_bar.setValue(current)
-        self.video_widget.update_progress(current)
-
-    def on_processing_finished(self):
-        print("[INFO] AI処理が完了しました")
-        self.full_stop()
-        self.mode_label.setText("📊 モード: 完了")
-
-    def seek_relative(self, delta):
-        if self.total_frames == 0 or not self.current_video:
+    
+    def format_time(self, seconds):
+        """秒を HH:MM:SS 形式に変換"""
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        s = int(seconds % 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    
+    def toggle_playback(self):
+        if not self.process_thread or not self.process_thread.isRunning():
+            if self.current_video:
+                self.start_processing_from_frame(self.current_frame)
             return
-        target_frame = max(0, min(self.current_frame + delta, self.total_frames - 1))
         
-        was_paused = self.is_paused
-        self.seek_to_frame(target_frame)
+        if self.is_paused:
+            # 再開
+            self.process_thread.resume()
+            # AudioThreadのresumeはProcessThread内で呼ばれる
+            self.is_paused = False
+            self.play_pause_btn.setText("⏸ 一時停止")
+            self.mode_label.setText("📊 モード: 🔄 AI処理中")
+            # 再生再開時は緑色
+            self.video_widget.set_progress_bar_color('#00ff00')
+        else:
+            # 一時停止
+            self.process_thread.pause()
+            # AudioThreadのpauseはProcessThread内で呼ばれる
+            self.is_paused = True
+            self.play_pause_btn.setText("▶ 再開")
+            self.mode_label.setText("📊 モード: ⏸ 一時停止中")
+            # 一時停止時は赤色
+            self.video_widget.set_progress_bar_color('red')
+    
+    def full_stop(self):
+        # AI処理スレッドの停止
+        if self.process_thread:
+            print("[DEBUG] AI処理スレッド停止中...")
+            self.process_thread.stop()
+            self.process_thread.wait(10000)
+            if self.process_thread and self.process_thread.isRunning():
+                print("[ERROR] AI処理スレッド強制終了")
+                self.process_thread.terminate()
+                self.process_thread.wait(2000)
+            
+            try:
+                self.process_thread.frame_ready.disconnect()
+                self.process_thread.fps_updated.disconnect()
+                self.process_thread.progress_updated.disconnect()
+                self.process_thread.finished_signal.disconnect()
+            except:
+                pass
+            
+            self.process_thread = None
         
-        if was_paused:
-             if self.process_thread:
-                 self.process_thread.pause()
-                 self.is_paused = True
-                 self.play_pause_btn.setText("▶ 再開")
-                 self.mode_label.setText("📊 モード: ⏸ 一時停止中")
-                 self.video_widget.set_progress_bar_color('red')
-
+        # 音声再生の停止
+        if self.audio_thread:
+            self.audio_thread.stop_playback()
+            
+        self.is_paused = False
+        self.play_pause_btn.setText("▶ 再開")
+        self.play_pause_btn.setEnabled(self.current_video is not None)
+        QApplication.processEvents()
+        time.sleep(0.05)
+    
+    def update_stats(self):
+        stats = self.frame_cache.get_stats()
+        self.cache_label.setText(f"💾 キャッシュ: {stats['size_mb']:.1f} MB ({stats['count']} frames)")
+    
     def closeEvent(self, event):
         print("=== 終了処理 ===")
         self.full_stop()
@@ -1525,397 +1634,28 @@ V0.9 - 30FPS最適化:
                 pass
         
         self.frame_cache.clear()
-        self.save_settings()
+        self.save_settings() # 終了時に設定を保存
         event.accept()
 
-    def seek_to_frame(self, target_frame):
-        if not self.current_video or self._seeking or self.total_frames == 0:
+    def seek_relative(self, delta):
+        if self.total_frames == 0 or not self.current_video:
             return
+        target_frame = max(0, min(self.current_frame + delta, self.total_frames - 1))
         
-        self._seeking = True
-        self.full_stop()
-        QApplication.processEvents()
-        time.sleep(0.1)
+        # シーク前の状態を保持
+        was_paused = self.is_paused
         
-        self.current_frame = target_frame
-        self.progress_bar.setValue(target_frame)
-        self.video_widget.update_progress(target_frame)
+        self.seek_to_frame(target_frame)
         
-        frame_data = self.frame_cache.get(target_frame)
-        if frame_data is not None:
-            self.video_widget.update_frame(frame_data)
-        
-        if self.audio_thread:
-            target_sec = target_frame / self.video_fps if self.video_fps > 0 else 0
-            self.audio_thread.seek_to_time(target_sec)
-        
-        self.start_processing_from_frame(target_frame)
-        self._seeking = False
+        # シーク後に一時停止状態だった場合は、再生を再開しない
+        if was_paused:
+             if self.process_thread:
+                 self.process_thread.pause()
+                 self.is_paused = True
+                 self.play_pause_btn.setText("▶ 再開")
+                 self.mode_label.setText("📊 モード: ⏸ 一時停止中")
+                 self.video_widget.set_progress_bar_color('red')
 
-    def seek_click(self, event):
-        if self.total_frames > 0:
-            pos = event.pos().x()
-            width = self.progress_bar.width()
-            target_frame = int((pos / width) * self.total_frames)
-            self.seek_to_frame(target_frame)
-
-    def open_video(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "動画選択", "", "Videos (*.mp4 *.avi *.mkv *.mov *.wmv *.flv *.webm)"
-        )
-        if path:
-            self.load_video(path)
-
-    def open_settings(self):
-        dialog = SettingsDialog(self, self.settings)
-        
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            new_settings = dialog.get_settings()
-            
-            if (new_settings.get('batch_size') != self.settings.get('batch_size') or 
-                new_settings.get('queue_size_mb') != self.settings.get('queue_size_mb') or 
-                new_settings.get('max_clip_length') != self.settings.get('max_clip_length') or
-                new_settings.get('cache_size_mb') != self.settings.get('cache_size_mb')):
-                
-                self.settings.update(new_settings)
-                self.save_settings()
-
-                print("[INFO] 設定変更 - 完全リセット実行")
-                self.full_stop()
-                self.frame_cache = FrameCache(max_size_mb=self.settings['cache_size_mb'])
-                
-                if self.current_video:
-                    self.load_video(self.current_video)
-                
-                print(f"[INFO] 新設定適用完了: {self.settings}")
-            else:
-                self.settings.update(new_settings)
-                self.save_settings()
-
-    def toggle_fullscreen_shortcut(self):
-        self.video_widget.toggle_fullscreen()
-
-    def escape_fullscreen_shortcut(self):
-        if self.video_widget.is_fullscreen:
-            self.video_widget.toggle_fullscreen()
-
-    def save_audio_settings(self):
-        self.save_settings()
-
-    def load_video(self, path):
-        print(f"[INFO] 動画読み込み: {path}")
-        self.full_stop()
-        self.frame_cache.clear()
-        self.video_widget.clear_frame()
-        
-        self.current_video = path
-        
-        fullpath = str(Path(path).resolve())
-        max_length = 100
-        if len(fullpath) > max_length:
-            fullpath = "..." + fullpath[-(max_length-3):]
-        self.filename_label.setText(f"🎬 {fullpath}")
-        self.filename_label.show()
-        
-        self.original_capture = None
-        if not self.ai_processing_enabled:
-            try:
-                self.original_capture = cv2.VideoCapture(str(path))
-                if not self.original_capture.isOpened():
-                    print("[ERROR] 元動画の読み込みに失敗")
-                    self.original_capture = None
-                else:
-                    print("[DEBUG] 元動画キャプチャ作成成功")
-            except Exception as e:
-                print(f"[ERROR] 元動画キャプチャ作成失敗: {e}")
-                self.original_capture = None
-        
-        try:
-            if self.ai_processing_enabled and LADA_AVAILABLE:
-                video_meta = video_utils.get_video_meta_data(path)
-                self.total_frames = video_meta.frames_count
-                self.video_fps = video_meta.video_fps
-            else:
-                temp_capture = cv2.VideoCapture(str(path))
-                if temp_capture.isOpened():
-                    self.total_frames = int(temp_capture.get(cv2.CAP_PROP_FRAME_COUNT))
-                    self.video_fps = temp_capture.get(cv2.CAP_PROP_FPS)
-                    temp_capture.release()
-                else:
-                    self.total_frames = 0
-                    self.video_fps = 30.0
-            
-            self.progress_bar.setMaximum(self.total_frames)
-            self.video_widget.set_video_info(self.total_frames, self.video_fps)
-            
-        except Exception as e:
-            print(f"[ERROR] 動画メタデータ取得失敗: {e}")
-            self.total_frames = 0
-            self.video_fps = 30.0
-        
-        self.start_processing_from_frame(0)
-        mode_text = "🎥 原画" if not self.ai_processing_enabled else "🤖 AI"
-        self.mode_label.setText(f"📊 選択: {Path(path).name} ({mode_text})")
-
-    def start_processing_from_frame(self, start_frame):
-        if not self.current_video:
-            return
-        
-        print(f"[DEBUG] フレーム{start_frame}から再生開始 (AI処理: {self.ai_processing_enabled})")
-        
-        # 既存のスレッド/タイマーが残っていないか確認
-        if self.process_thread and self.process_thread.isRunning():
-            print("[WARNING] 既存のAIスレッドが動作中です。強制停止します。")
-            self.full_stop()
-            QApplication.processEvents()
-            time.sleep(0.1)
-        
-        if hasattr(self, 'original_timer') and self.original_timer and self.original_timer.isActive():
-            print("[WARNING] 既存の原画タイマーが動作中です。停止します。")
-            self.original_timer.stop()
-            QApplication.processEvents()
-            time.sleep(0.1)
-        
-        # AI処理無効時はOpenCVで直接再生
-        if not self.ai_processing_enabled:
-            self.start_original_playback(start_frame)
-            return
-        
-        # AI処理有効時
-        if not LADA_AVAILABLE:
-            self.mode_label.setText("エラー: LADA利用不可")
-            return
-        
-        # スレッドが既に動作していないか再確認
-        if self.process_thread and self.process_thread.isRunning():
-            print("[ERROR] スレッドがまだ動作しています。処理を中止します。")
-            return
-        
-        model_dir = LADA_BASE_PATH / "model_weights"
-        detection_path = model_dir / "lada_mosaic_detection_model_v3.1_fast.pt"
-        restoration_path = model_dir / "lada_mosaic_restoration_model_generic_v1.2.pth"
-        
-        if not detection_path.exists() or not restoration_path.exists():
-            self.mode_label.setText("エラー: モデルなし")
-            return
-        
-        self.thread_counter += 1
-        current_id = self.thread_counter
-        
-        # 新しいスレッドを作成
-        self.process_thread = ProcessThread(
-            self.current_video, detection_path, restoration_path,
-            self.frame_cache, start_frame, current_id, self.settings,
-            audio_thread=self.audio_thread, video_fps=self.video_fps
-        )
-        
-        # シグナル接続
-        self.process_thread.frame_ready.connect(
-            lambda frame, num, cached: self.on_frame_ready(frame, num, cached, current_id)
-        )
-        self.process_thread.fps_updated.connect(
-            lambda fps: self.fps_label.setText(f"⚡ FPS: {fps:.1f}")
-        )
-        self.process_thread.progress_updated.connect(
-            lambda c, t: self.on_progress_update(c, t)
-        )
-        self.process_thread.finished_signal.connect(self.on_processing_finished)
-        
-        # スレッド開始
-        self.process_thread.start()
-        self.is_playing = True
-        self.is_paused = False
-        self.play_pause_btn.setEnabled(True)
-        self.play_pause_btn.setText("⏸ 一時停止")
-        self.mode_label.setText("📊 モード: 🔄 AI処理中")
-        self.video_widget.set_progress_bar_color('#00ff00')
-        
-        print(f"[DEBUG] AI処理スレッド開始完了: ID{current_id}")
-
-    def start_original_playback(self, start_frame):
-        """AI処理無効時の元動画再生 - 確実に単一インスタンスのみ"""
-        print(f"[DEBUG] 原画再生開始: フレーム{start_frame}")
-        
-        # 既存のキャプチャとタイマーを確実にクリーンアップ
-        if hasattr(self, 'original_capture') and self.original_capture:
-            self.original_capture.release()
-            self.original_capture = None
-        
-        if hasattr(self, 'original_timer') and self.original_timer:
-            self.original_timer.stop()
-            self.original_timer = None
-        
-        # 新しいキャプチャを作成
-        try:
-            self.original_capture = cv2.VideoCapture(str(self.current_video))
-            if not self.original_capture.isOpened():
-                print("[ERROR] 元動画の読み込みに失敗")
-                self.mode_label.setText("エラー: 動画読み込み失敗")
-                return
-        except Exception as e:
-            print(f"[ERROR] 元動画キャプチャ作成失敗: {e}")
-            self.mode_label.setText("エラー: 動画読み込み失敗")
-            return
-        
-        # フレーム位置を設定
-        self.original_capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        self.current_frame = start_frame
-        
-        # 新しいタイマーを作成
-        self.original_timer = QTimer()
-        self.original_timer.timeout.connect(self.update_original_frame)
-        frame_interval = int(1000 / self.video_fps) if self.video_fps > 0 else 33
-        self.original_timer.start(frame_interval)
-        
-        # 状態設定
-        self.is_playing = True
-        self.is_paused = False
-        self.play_pause_btn.setEnabled(True)
-        self.play_pause_btn.setText("⏸ 一時停止")
-        self.mode_label.setText("📊 モード: 🎥 原画再生")
-        self.video_widget.set_progress_bar_color('#00ff00')
-        
-        # 音声再生開始
-        if self.audio_thread:
-            start_sec = start_frame / self.video_fps if self.video_fps > 0 else 0
-            self.audio_thread.start_playback(str(self.current_video), start_sec)
-        
-        print(f"[DEBUG] 原画再生開始完了: フレーム{start_frame}, 間隔{frame_interval}ms")
-
-    def update_original_frame(self):
-        if not hasattr(self, 'original_capture') or not self.original_capture or not self.is_playing or self.is_paused:
-            return
-        
-        ret, frame = self.original_capture.read()
-        if ret:
-            self.video_widget.update_frame(frame)
-            self.current_frame += 1
-            self.progress_bar.setValue(self.current_frame)
-            self.video_widget.update_progress(self.current_frame)
-            
-            current_sec = self.current_frame / self.video_fps if self.video_fps > 0 else 0
-            total_sec = self.total_frames / self.video_fps if self.video_fps > 0 else 0
-            current_time = self.format_time(current_sec)
-            total_time = self.format_time(total_sec)
-            self.time_label.setText(f"{current_time} / {total_time}")
-            
-            if self.current_frame >= self.total_frames:
-                self.original_timer.stop()
-                self.is_playing = False
-                self.play_pause_btn.setText("▶ 再生")
-                self.mode_label.setText("📊 モード: 🎥 再生完了")
-                print("[DEBUG] 原画再生完了")
-        else:
-            self.original_timer.stop()
-            self.is_playing = False
-            self.play_pause_btn.setText("▶ 再生")
-            self.mode_label.setText("📊 モード: 🎥 再生完了")
-            print("[DEBUG] 原画再生終了")
-
-    def toggle_playback(self):
-        if not self.ai_processing_enabled and hasattr(self, 'original_timer'):
-            if self.is_paused:
-                self.original_timer.start()
-                self.is_paused = False
-                self.play_pause_btn.setText("⏸ 一時停止")
-                self.mode_label.setText("📊 モード: 🎥 原画再生")
-                self.video_widget.set_progress_bar_color('#00ff00')
-                
-                if self.audio_thread:
-                    start_sec = self.current_frame / self.video_fps if self.video_fps > 0 else 0
-                    self.audio_thread.resume_audio(start_sec)
-            else:
-                self.original_timer.stop()
-                self.is_paused = True
-                self.play_pause_btn.setText("▶ 再開")
-                self.mode_label.setText("📊 モード: 🎥 一時停止中")
-                self.video_widget.set_progress_bar_color('red')
-                
-                if self.audio_thread:
-                    self.audio_thread.pause_audio()
-            return
-        
-        if not self.process_thread or not self.process_thread.isRunning():
-            if self.current_video:
-                self.start_processing_from_frame(self.current_frame)
-            return
-        
-        if self.is_paused:
-            self.process_thread.resume()
-            self.is_paused = False
-            self.play_pause_btn.setText("⏸ 一時停止")
-            self.mode_label.setText("📊 モード: 🔄 AI処理中")
-            self.video_widget.set_progress_bar_color('#00ff00')
-        else:
-            self.process_thread.pause()
-            self.is_paused = True
-            self.play_pause_btn.setText("▶ 再開")
-            self.mode_label.setText("📊 モード: ⏸ 一時停止中")
-            self.video_widget.set_progress_bar_color('red')
-
-    def full_stop(self):
-        """完全停止 - AI処理と原画処理の両方を確実に停止"""
-        print("[DEBUG] 完全停止実行")
-        
-        # まず全ての再生を停止
-        self.is_playing = False
-        self.is_paused = False
-        
-        # 原画処理の停止
-        if hasattr(self, 'original_timer') and self.original_timer:
-            self.original_timer.stop()
-            print("[DEBUG] 原画タイマー停止")
-        
-        if hasattr(self, 'original_capture') and self.original_capture:
-            self.original_capture.release()
-            self.original_capture = None
-            print("[DEBUG] 原画キャプチャ解放")
-        
-        # AI処理スレッドの停止（強制的に）
-        if self.process_thread:
-            print("[DEBUG] AI処理スレッド停止中...")
-            # フラグ設定
-            self.process_thread._stop_flag = True
-            self.process_thread.is_running = False
-            self.process_thread.is_paused = False
-            
-            # 優雅に停止を試みる
-            self.process_thread.stop()
-            
-            # 待機
-            if not self.process_thread.wait(2000):  # 2秒待機
-                print("[WARNING] AIスレッドが応答しないため強制終了")
-                self.process_thread.terminate()
-                self.process_thread.wait(1000)
-            
-            # 接続を切断
-            try:
-                if self.process_thread.frame_ready:
-                    self.process_thread.frame_ready.disconnect()
-                if self.process_thread.fps_updated:
-                    self.process_thread.fps_updated.disconnect()
-                if self.process_thread.progress_updated:
-                    self.process_thread.progress_updated.disconnect()
-                if self.process_thread.finished_signal:
-                    self.process_thread.finished_signal.disconnect()
-            except:
-                pass
-            
-            self.process_thread = None
-            print("[DEBUG] AI処理スレッド停止完了")
-        
-        # 音声停止
-        if self.audio_thread:
-            self.audio_thread.stop_playback()
-            print("[DEBUG] 音声停止")
-        
-        # UI状態リセット
-        self.play_pause_btn.setText("▶ 再生")
-        self.play_pause_btn.setEnabled(self.current_video is not None)
-        
-        QApplication.processEvents()
-        time.sleep(0.1)  # 少し長めに待機
-        print("[DEBUG] 完全停止完了")
 
 def main():
     app = QApplication(sys.argv)

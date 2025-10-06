@@ -6,11 +6,11 @@
 
 　rp_pf.py　をLadaインストールフォルダにコピー
 
-　追加パッケージ3つをインストール　
+　追加パッケージ4つをインストール　
 
 　Ladaインストールフォルダで、
 　
-　.\python\python.exe -m pip install PyQt6 PyOpenGL PyOpenGL-accelerate
+　.\python\python.exe -m pip install PyQt6 PyOpenGL PyOpenGL-accelerate python-vlc
 
 3.起動方法
 
@@ -23,16 +23,14 @@
 　停止再開：　　　　画面クリック、SPACE
 　再生位置移動：　　進捗バーをクリック
 　フルスクリーン：　ダブルクリック、F
+　など
 
 　設定のバッチフレーム数は12にしておいてください。
-　現在はこれ以上だと逆にオーバーヘッドとなります。
-
 　クリップ長が品質と速度のトレードオフ値です。
 
 5.制限事項
 
-　音は出ません。今後対応予定。
-　最大15FPS程度です。（RTX 2060以上ならどれでも違いなし）
+　音は出ますが、まだ調整要です。
 
-　Ladaの内部処理を変更して処理速度改善中です。乞うご期待！
+
 
