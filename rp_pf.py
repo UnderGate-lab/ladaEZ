@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-LADA REALTIME PLAYER V0.9
-フルスクリーン進捗バー + 設定機能 + 再生速度制御 + 音声機能追加
+LADA REALTIME PLAYER V1.0
+
 """
 
 import sys
@@ -10,11 +10,12 @@ import cv2
 import numpy as np
 import time
 import json
-from collections import OrderedDict
+import gc
+from collections import OrderedDict, deque
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QProgressBar, QTextEdit,
-    QDialog, QSpinBox, QFormLayout, QDialogButtonBox, QSlider, QSizePolicy
+    QDialog, QSpinBox, QFormLayout, QDialogButtonBox, QSlider, QSizePolicy, QMessageBox
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QMutex, QMutexLocker, QTimer, QPoint
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
@@ -83,6 +84,13 @@ class SettingsDialog(QDialog):
         self.cache_size_spin.setSuffix(" MB")
         layout.addRow("キャッシュサイズ:", self.cache_size_spin)
         
+        self.chunk_frames_spin = QSpinBox()
+        self.chunk_frames_spin.setRange(30, 450)  # 1秒〜15秒 (30fps想定)
+        self.chunk_frames_spin.setValue(self.settings.get('chunk_frames', 150))
+        self.chunk_frames_spin.setSuffix(" frames")
+        self.chunk_frames_spin.setToolTip("チャンクあたりのフレーム数 (推奨: 150 = 5秒@30fps)")
+        layout.addRow("チャンクサイズ:", self.chunk_frames_spin)
+        
         info = QLabel(
             "※設定変更後、処理が完全リセットされます\n"
             "※高い値 = 高速だがメモリ消費大\n"
@@ -104,54 +112,217 @@ class SettingsDialog(QDialog):
             'batch_size': self.batch_size_spin.value(),
             'queue_size_mb': self.queue_size_spin.value(),
             'max_clip_length': self.clip_length_spin.value(),
-            'cache_size_mb': self.cache_size_spin.value()
+            'cache_size_mb': self.cache_size_spin.value(),
+            'chunk_frames': self.chunk_frames_spin.value()
         }
 
 
-class FrameCache:
-    def __init__(self, max_size_mb=12288):
-        self.cache = OrderedDict()
+class ChunkBasedCache:
+    """チャンクベースの高性能キャッシュ"""
+    
+    def __init__(self, max_size_mb=12288, chunk_frames=150):
+        self.chunk_frames = chunk_frames
         self.max_size_mb = max_size_mb
         self.current_size_mb = 0
+        
+        # チャンク管理
+        self.chunks = {}  # chunk_id -> {'frames': dict, 'size_mb': float, 'last_access': float}
+        self.access_order = deque()  # LRU順序
         self.mutex = QMutex()
-    
+        
+        # 非同期クリーンアップ
+        self.cleanup_timer = QTimer()
+        self.cleanup_timer.timeout.connect(self._async_cleanup)
+        self.cleanup_timer.setSingleShot(True)
+        self.pending_cleanup = False
+        
+        # 再生状態
+        self.current_playhead = 0
+        
+        print(f"[CACHE] 初期化: {max_size_mb}MB, チャンク={chunk_frames}フレーム")
+
+    def get_chunk_id(self, frame_num):
+        """フレーム番号からチャンクIDを計算"""
+        return frame_num // self.chunk_frames
+
+    def get_chunk_range(self, chunk_id):
+        """チャンクのフレーム範囲を取得"""
+        start_frame = chunk_id * self.chunk_frames
+        end_frame = start_frame + self.chunk_frames - 1
+        return start_frame, end_frame
+
     def get(self, frame_num):
+        """フレーム取得 - 外部インターフェースは変更なし"""
         with QMutexLocker(self.mutex):
-            if frame_num in self.cache:
-                self.cache.move_to_end(frame_num)
-                return self.cache[frame_num]
+            chunk_id = self.get_chunk_id(frame_num)
+            
+            if chunk_id in self.chunks:
+                chunk = self.chunks[chunk_id]
+                if frame_num in chunk['frames']:
+                    # アクセス記録更新
+                    chunk['last_access'] = time.time()
+                    self._update_access_order(chunk_id)
+                    return chunk['frames'][frame_num]
             return None
-    
+
     def put(self, frame_num, frame):
+        """フレーム追加 - 外部インターフェースは変更なし"""
         with QMutexLocker(self.mutex):
             if frame is None:
-                # キャッシュ無効化用
-                if frame_num in self.cache:
-                    oldest_frame = self.cache.pop(frame_num)
-                    self.current_size_mb -= oldest_frame.nbytes / (1024 * 1024)
+                self._remove_frame(frame_num)
                 return
                 
+            chunk_id = self.get_chunk_id(frame_num)
+            
+            # チャンクがなければ作成
+            if chunk_id not in self.chunks:
+                self.chunks[chunk_id] = {
+                    'frames': {},
+                    'size_mb': 0,
+                    'last_access': time.time()
+                }
+            
+            chunk = self.chunks[chunk_id]
             frame_size_mb = frame.nbytes / (1024 * 1024)
             
-            while self.current_size_mb + frame_size_mb > self.max_size_mb and len(self.cache) > 0:
-                oldest_frame_num, oldest_frame = self.cache.popitem(last=False)
-                self.current_size_mb -= oldest_frame.nbytes / (1024 * 1024)
+            # 既存フレームを上書きする場合はサイズ調整
+            if frame_num in chunk['frames']:
+                old_frame = chunk['frames'][frame_num]
+                old_size_mb = old_frame.nbytes / (1024 * 1024)
+                chunk['size_mb'] -= old_size_mb
+                self.current_size_mb -= old_size_mb
             
-            if self.current_size_mb + frame_size_mb <= self.max_size_mb:
-                self.cache[frame_num] = frame.copy()
-                self.current_size_mb += frame_size_mb
-    
+            # 新規フレーム追加
+            chunk['frames'][frame_num] = frame
+            chunk['size_mb'] += frame_size_mb
+            chunk['last_access'] = time.time()
+            self.current_size_mb += frame_size_mb
+            
+            # LRU更新
+            self._update_access_order(chunk_id)
+            
+            # 容量超過時は非同期クリーンアップをスケジュール
+            if self.current_size_mb > self.max_size_mb:
+                self._schedule_async_cleanup()
+
+    def _update_access_order(self, chunk_id):
+        """LRU順序を更新"""
+        if chunk_id in self.access_order:
+            self.access_order.remove(chunk_id)
+        self.access_order.append(chunk_id)
+
+    def _schedule_async_cleanup(self):
+        """非同期クリーンアップをスケジュール"""
+        if not self.pending_cleanup and not self.cleanup_timer.isActive():
+            self.pending_cleanup = True
+            self.cleanup_timer.start(50)  # 50ms後に実行
+
+    def _async_cleanup(self):
+        """非同期でチャンク単位のクリーンアップを実行"""
+        if not self.pending_cleanup:
+            return
+            
+        start_time = time.time()
+        removed_count = 0
+        
+        with QMutexLocker(self.mutex):
+            if self.current_size_mb <= self.max_size_mb * 0.8:
+                self.pending_cleanup = False
+                return
+            
+            # 保護対象のチャンクを計算
+            protected_chunks = self._get_protected_chunks()
+            
+            # 最も古く、保護対象外のチャンクから削除
+            for chunk_id in list(self.access_order):
+                if chunk_id not in protected_chunks:
+                    if self._remove_chunk(chunk_id):
+                        removed_count += 1
+                    
+                    # 十分な空き容量ができたら終了
+                    if self.current_size_mb <= self.max_size_mb * 0.7:
+                        break
+                    
+                    # 一度に削除するチャンク数を制限
+                    if removed_count >= 3:
+                        break
+            
+            # 必要に応じて継続
+            if self.current_size_mb > self.max_size_mb * 0.8:
+                self.cleanup_timer.start(25)
+            else:
+                self.pending_cleanup = False
+        
+        cleanup_time = (time.time() - start_time) * 1000
+        if removed_count > 0:
+            print(f"[CACHE] 非同期整理: {removed_count}チャンク削除, {cleanup_time:.1f}ms")
+
+    def _get_protected_chunks(self):
+        """保護対象のチャンクを計算"""
+        current_chunk = self.get_chunk_id(self.current_playhead)
+        protected = set()
+        
+        # 現在のチャンクと前後2チャンクを保護
+        for offset in range(-2, 3):  # -2, -1, 0, 1, 2
+            protected.add(current_chunk + offset)
+        
+        return protected
+
+    def _remove_chunk(self, chunk_id):
+        """チャンク全体を削除"""
+        if chunk_id in self.chunks:
+            chunk = self.chunks[chunk_id]
+            self.current_size_mb -= chunk['size_mb']
+            del self.chunks[chunk_id]
+            
+            if chunk_id in self.access_order:
+                self.access_order.remove(chunk_id)
+            
+            return True
+        return False
+
+    def _remove_frame(self, frame_num):
+        """単一フレームを削除（特殊ケース用）"""
+        chunk_id = self.get_chunk_id(frame_num)
+        if chunk_id in self.chunks:
+            chunk = self.chunks[chunk_id]
+            if frame_num in chunk['frames']:
+                frame = chunk['frames'][frame_num]
+                frame_size_mb = frame.nbytes / (1024 * 1024)
+                
+                del chunk['frames'][frame_num]
+                chunk['size_mb'] -= frame_size_mb
+                self.current_size_mb -= frame_size_mb
+                
+                # チャンクが空になったら完全削除
+                if not chunk['frames']:
+                    self._remove_chunk(chunk_id)
+
+    def update_playhead(self, frame_num):
+        """再生位置を更新（保護対象の計算用）"""
+        self.current_playhead = frame_num
+
     def clear(self):
+        """キャッシュ全クリア"""
         with QMutexLocker(self.mutex):
-            self.cache.clear()
+            self.chunks.clear()
+            self.access_order.clear()
             self.current_size_mb = 0
-    
+            self.pending_cleanup = False
+            self.cleanup_timer.stop()
+
     def get_stats(self):
+        """キャッシュ統計を取得"""
         with QMutexLocker(self.mutex):
+            chunk_count = len(self.chunks)
+            total_frames = sum(len(chunk['frames']) for chunk in self.chunks.values())
+            
             return {
-                'count': len(self.cache),
+                'chunk_count': chunk_count,
+                'total_frames': total_frames,
                 'size_mb': self.current_size_mb,
-                'max_mb': self.max_size_mb
+                'max_mb': self.max_size_mb,
+                'chunk_frames': self.chunk_frames
             }
 
 
@@ -159,8 +330,8 @@ class VideoGLWidget(QOpenGLWidget):
     playback_toggled = pyqtSignal()
     video_dropped = pyqtSignal(str)
     seek_requested = pyqtSignal(int)
-    toggle_mute_signal = pyqtSignal()  # 追加: ミュートトグルシグナル
-    toggle_ai_processing_signal = pyqtSignal()  # 追加: AI処理トグルシグナル
+    toggle_mute_signal = pyqtSignal()
+    toggle_ai_processing_signal = pyqtSignal()
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -215,7 +386,6 @@ class VideoGLWidget(QOpenGLWidget):
         self.video_fps = 30.0
         
         self.setMouseTracking(True)
-        print("[DEBUG] D&D有効化 + フルスクリーンUI初期化")
     
     def set_video_info(self, total_frames, fps):
         """動画情報を設定"""
@@ -246,20 +416,17 @@ class VideoGLWidget(QOpenGLWidget):
     def show_fs_ui(self):
         """フルスクリーンUI表示"""
         if self.is_fullscreen:
-            # UI位置を強制更新
             self.update_fs_ui_position()
-            
             self.fs_progress_bar.show()
             self.fs_time_label.show()
             QApplication.setOverrideCursor(Qt.CursorShape.ArrowCursor)
-            self.ui_hide_timer.start(3000)  # 3秒後に自動非表示
+            self.ui_hide_timer.start(3000)
     
     def update_fs_ui_position(self):
         """フルスクリーンUI位置更新"""
         if not self.is_fullscreen:
             return
             
-        # 進捗バーを画面下部に配置
         bar_height = 8
         bar_margin = 20
         self.fs_progress_bar.setGeometry(
@@ -269,7 +436,6 @@ class VideoGLWidget(QOpenGLWidget):
             bar_height
         )
         
-        # 時間表示を進捗バーの上に配置
         self.fs_time_label.adjustSize()
         self.fs_time_label.move(
             (self.width() - self.fs_time_label.width()) // 2,
@@ -284,13 +450,11 @@ class VideoGLWidget(QOpenGLWidget):
             QApplication.restoreOverrideCursor()
     
     def resizeEvent(self, event):
-        """リサイズ時にUI位置調整"""
         super().resizeEvent(event)
         if self.is_fullscreen:
             self.update_fs_ui_position()
     
     def mouseMoveEvent(self, event):
-        """マウス移動でUI表示"""
         if self.is_fullscreen:
             self.show_fs_ui()
         super().mouseMoveEvent(event)
@@ -306,41 +470,49 @@ class VideoGLWidget(QOpenGLWidget):
             if 0 <= relative_pos <= bar_width:
                 target_frame = int((relative_pos / bar_width) * self.total_frames)
                 self.seek_requested.emit(target_frame)
-                print(f"[DEBUG] フルスクリーンシーク: {target_frame}")
     
     def dragEnterEvent(self, event: QDragEnterEvent):
-        """ドラッグ開始時のイベント"""
         if event.mimeData().hasUrls():
-            # 動画ファイルかチェック
             urls = event.mimeData().urls()
             if urls:
                 file_path = urls[0].toLocalFile()
                 if self.is_video_file(file_path):
                     event.acceptProposedAction()
-                    print(f"[DEBUG] D&D: 動画ファイル検出 - {file_path}")
     
     def dragMoveEvent(self, event):
-        """ドラッグ中のイベント"""
         if event.mimeData().hasUrls():
             urls = event.mimeData().urls()
             if urls and self.is_video_file(urls[0].toLocalFile()):
                 event.acceptProposedAction()
     
     def dropEvent(self, event: QDropEvent):
-        """ドロップ時のイベント"""
         urls = event.mimeData().urls()
         if urls:
             file_path = urls[0].toLocalFile()
             if self.is_video_file(file_path):
-                print(f"[DEBUG] D&D: 動画ファイルをドロップ - {file_path}")
                 self.video_dropped.emit(file_path)
                 event.acceptProposedAction()
     
     def is_video_file(self, file_path):
-        """動画ファイルかどうかを判定"""
         video_extensions = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.ts']
         file_ext = Path(file_path).suffix.lower()
         return file_ext in video_extensions
+    
+    def get_main_window(self):
+        """メインウィンドウを安全に取得"""
+        # 親ウィジェットから再帰的にメインウィンドウを探す
+        parent = self.parent()
+        while parent is not None:
+            if hasattr(parent, 'seek_relative'):
+                return parent
+            parent = parent.parent()
+        
+        # トップレベルウィンドウから探す
+        for widget in QApplication.topLevelWidgets():
+            if hasattr(widget, 'seek_relative'):
+                return widget
+        
+        return None
     
     def keyPressEvent(self, event):
         if self.is_fullscreen:
@@ -348,71 +520,55 @@ class VideoGLWidget(QOpenGLWidget):
             if key == Qt.Key.Key_F or key == Qt.Key.Key_Escape:
                 self.toggle_fullscreen()
             elif key == Qt.Key.Key_Space or key == Qt.Key.Key_K:
-                for widget in QApplication.topLevelWidgets():
-                    if isinstance(widget, QMainWindow) and hasattr(widget, 'toggle_playback'):
-                        widget.toggle_playback()
-                        break
+                self.playback_toggled.emit()
             elif key == Qt.Key.Key_Right or key == Qt.Key.Key_L:
-                for widget in QApplication.topLevelWidgets():
-                    if isinstance(widget, QMainWindow) and hasattr(widget, 'seek_relative'):
-                        widget.seek_relative(300)
-                        break
+                main_window = self.get_main_window()
+                if main_window:
+                    main_window.seek_relative(300)
             elif key == Qt.Key.Key_Left or key == Qt.Key.Key_J:
-                for widget in QApplication.topLevelWidgets():
-                    if isinstance(widget, QMainWindow) and hasattr(widget, 'seek_relative'):
-                        widget.seek_relative(-300)
-                        break
+                main_window = self.get_main_window()
+                if main_window:
+                    main_window.seek_relative(-300)
             elif key == Qt.Key.Key_Semicolon:
-                for widget in QApplication.topLevelWidgets():
-                    if isinstance(widget, QMainWindow) and hasattr(widget, 'seek_relative'):
-                        widget.seek_relative(30)
-                        break
+                main_window = self.get_main_window()
+                if main_window:
+                    main_window.seek_relative(30)
             elif key == Qt.Key.Key_H:
-                for widget in QApplication.topLevelWidgets():
-                    if isinstance(widget, QMainWindow) and hasattr(widget, 'seek_relative'):
-                        widget.seek_relative(-30)
-                        break
-            elif key == Qt.Key.Key_M:  # 追加: Mキーでミュートトグル
+                main_window = self.get_main_window()
+                if main_window:
+                    main_window.seek_relative(-30)
+            elif key == Qt.Key.Key_M:
                 self.toggle_mute_signal.emit()
-            elif key == Qt.Key.Key_X:  # 追加: XキーでAI処理トグル
+            elif key == Qt.Key.Key_X:
                 self.toggle_ai_processing_signal.emit()
         else:
-            # 通常画面でもショートカットを処理
             key = event.key()
-            if key == Qt.Key.Key_M:  # 追加: Mキーでミュートトグル
+            if key == Qt.Key.Key_M:
                 self.toggle_mute_signal.emit()
-            elif key == Qt.Key.Key_X:  # 追加: XキーでAI処理トグル
+            elif key == Qt.Key.Key_X:
                 self.toggle_ai_processing_signal.emit()
             else:
                 super().keyPressEvent(event)
     
     def mouseDoubleClickEvent(self, event):
-        """ダブルクリックでフルスクリーン切り替え - 再生状態を保持"""
-        # 現在の再生状態を取得
         parent = self.window()
         if hasattr(parent, 'is_paused'):
             current_pause_state = parent.is_paused
         
-        # フルスクリーン切り替え
         self.toggle_fullscreen()
         
-        # フルスクリーン状態変更後、再生状態を元に戻す
         if hasattr(parent, 'is_paused') and hasattr(parent, 'process_thread'):
-            # 少し待ってから状態を復元
             QTimer.singleShot(100, lambda: self.restore_playback_state(parent, current_pause_state))
     
     def restore_playback_state(self, parent, original_pause_state):
-        """再生状態を復元"""
         if hasattr(parent, 'process_thread') and parent.process_thread and parent.process_thread.isRunning():
             if original_pause_state:
-                # 元々一時停止中だった場合は一時停止を維持
                 parent.process_thread.pause()
                 parent.is_paused = True
                 parent.play_pause_btn.setText("▶ 再開")
                 parent.mode_label.setText("📊 モード: ⏸ 一時停止中")
                 self.set_progress_bar_color('red')
             else:
-                # 元々再生中だった場合は再生を継続
                 parent.process_thread.resume()
                 parent.is_paused = False
                 parent.play_pause_btn.setText("⏸ 一時停止")
@@ -420,7 +576,6 @@ class VideoGLWidget(QOpenGLWidget):
                 self.set_progress_bar_color('#00ff00')
     
     def mousePressEvent(self, event):
-        # フルスクリーン時の進捗バークリック判定
         if self.is_fullscreen and self.fs_progress_bar.isVisible():
             bar_geom = self.fs_progress_bar.geometry()
             if bar_geom.contains(event.pos()):
@@ -449,14 +604,10 @@ class VideoGLWidget(QOpenGLWidget):
             self.raise_()
             self.is_fullscreen = True
             
-            # フルスクリーン移行後にUI位置を更新
-            QApplication.processEvents()  # ウィンドウサイズ確定を待つ
+            QApplication.processEvents()
             self.update_fs_ui_position()
-            
-            # フルスクリーンUI表示
             self.show_fs_ui()
         else:
-            # フルスクリーンUI非表示
             self.hide_fs_ui()
             self.ui_hide_timer.stop()
             
@@ -539,7 +690,6 @@ class VideoGLWidget(QOpenGLWidget):
         if self.frame_width != w or self.frame_height != h:
             self.frame_width = w
             self.frame_height = h
-            print(f"[DEBUG] フレーム解像度: {w}x{h}")
         
         self.makeCurrent()
         
@@ -580,7 +730,6 @@ class VideoGLWidget(QOpenGLWidget):
         self.update()
 
     def set_progress_bar_color(self, color):
-        """進捗バーの色を設定"""
         self.fs_progress_bar.setStyleSheet(f"""
             QProgressBar {{
                 background-color: rgba(40, 40, 40, 200);
@@ -592,6 +741,9 @@ class VideoGLWidget(QOpenGLWidget):
             }}
         """)
 
+
+# 以下のクラスは変更なし（OptimizedFrameRestorer, ProcessThread, AudioThread）
+# ただし、LadaFinalPlayerの設定変更処理を修正
 
 class OptimizedFrameRestorer:
     def __init__(self, device, video_file, preserve_relative_scale, max_clip_length,
@@ -615,20 +767,17 @@ class OptimizedFrameRestorer:
         w = self._parent.video_meta_data.video_width
         h = self._parent.video_meta_data.video_height
         
-        # より効率的なキューサイズ計算
-        frame_size_bytes = w * h * 3  # RGB
-        clip_size_bytes = max_clip_length * 256 * 256 * 4  # 保守的な見積もり
+        frame_size_bytes = w * h * 3
+        clip_size_bytes = max_clip_length * 256 * 256 * 4
         
         max_frames = max(100, (queue_size_mb * 1024 * 1024) // frame_size_bytes)
         max_clips = max(10, (queue_size_mb * 1024 * 1024) // clip_size_bytes)
         
-        # 非同期処理用のキュー改善
         self._parent.frame_restoration_queue = queue.Queue(maxsize=max_frames)
         self._parent.mosaic_clip_queue = queue.Queue(maxsize=max_clips)
         self._parent.restored_clip_queue = queue.Queue(maxsize=max_clips)
         self._parent.mosaic_detector.mosaic_clip_queue = self._parent.mosaic_clip_queue
         
-        # バッチ処理の最適化
         self._parent.batch_size = min(batch_size, max_clip_length)
         
         print(f"[OPTIMIZE] Queue: {max_frames}f, {max_clips}c ({queue_size_mb}MB)")
@@ -672,21 +821,20 @@ class ProcessThread(QThread):
         self.is_paused = False
         self.pause_mutex = QMutex()
         
-        self.audio_thread = audio_thread  # 追加: AudioThreadへの参照
-        self.video_fps = video_fps        # 追加: 音声同期用
-        self.total_frames = 0             # 追加: 音声同期用
+        self.audio_thread = audio_thread
+        self.video_fps = video_fps
+        self.total_frames = 0
     
     def pause(self):
         with QMutexLocker(self.pause_mutex):
             self.is_paused = True
             if self.audio_thread:
-                self.audio_thread.pause_audio() # 音声一時停止
+                self.audio_thread.pause_audio()
     
     def resume(self):
         with QMutexLocker(self.pause_mutex):
             self.is_paused = False
             if self.audio_thread:
-                # フレーム数から秒数を計算し、音声再生を再開
                 start_sec = self.start_frame / self.video_fps if self.video_fps > 0 else 0
                 self.audio_thread.resume_audio(start_sec)
     
@@ -753,29 +901,31 @@ class ProcessThread(QThread):
             last_mode_was_cached = False
             frame_count_at_reset = self.start_frame
             
-            # 音声再生開始 (スタートフレームの位置から)
+            # キャッシュに再生位置を通知
+            self.frame_cache.update_playhead(frame_count)
+            
             if self.audio_thread:
                 start_sec = self.start_frame / self.video_fps if self.video_fps > 0 else 0
                 self.audio_thread.start_playback(str(self.video_path), start_sec)
                 
-            # 一時停止中のキャッシュ蓄積設定
-            cache_frames_during_pause = 1800  # 一時停止中に蓄積するフレーム数(約30秒分@60fps)
+            cache_frames_during_pause = 1800
             paused_cache_count = 0
             
-            # フレーム処理の最適化
             consecutive_cached_frames = 0
-            max_consecutive_cached = 30  # 連続キャッシュフレーム数の上限
+            max_consecutive_cached = 30
             
             while self.is_running and not self._stop_flag and frame_count < self.total_frames:
+                # キャッシュに再生位置を定期的に通知
+                if frame_count % 30 == 0:
+                    self.frame_cache.update_playhead(frame_count)
+                
                 if self.is_paused and not self._stop_flag:
                     if pause_start_time == 0:
                         pause_start_time = time.time()
                         paused_cache_count = 0
                         print(f"[DEBUG] 一時停止開始 - バックグラウンドキャッシュ蓄積中(目標:{cache_frames_during_pause}フレーム)")
                     
-                    # 一時停止中もキャッシュ蓄積を継続(上限まで)
                     if paused_cache_count < cache_frames_during_pause:
-                        # キャッシュ未登録のフレームを先行取得
                         if self.frame_cache.get(frame_count + paused_cache_count) is None:
                             try:
                                 item = next(frame_restorer_iter)
@@ -792,12 +942,11 @@ class ProcessThread(QThread):
                         else:
                             paused_cache_count += 1
                     else:
-                        # キャッシュ上限到達
                         if paused_cache_count == cache_frames_during_pause:
                             print(f"[DEBUG] 一時停止中キャッシュ完了: {cache_frames_during_pause}フレーム蓄積済み - 待機モード")
-                            paused_cache_count += 1  # フラグ用に1増やす
+                            paused_cache_count += 1
                     
-                    time.sleep(0.01)  # 短い待機でレスポンス向上
+                    time.sleep(0.01)
                     continue
                 
                 if pause_start_time > 0:
@@ -810,7 +959,6 @@ class ProcessThread(QThread):
                 if self._stop_flag:
                     break
                 
-                # キャッシュ優先チェック(再開直後は特にキャッシュ活用)
                 cached_frame = self.frame_cache.get(frame_count)
                 
                 if cached_frame is not None:
@@ -818,10 +966,8 @@ class ProcessThread(QThread):
                     is_cached = True
                     consecutive_cached_frames += 1
                     
-                    # 連続キャッシュが多すぎる場合はAI処理を促進
                     if consecutive_cached_frames > max_consecutive_cached:
-                        # 次のフレームをAI処理で強制更新
-                        self.frame_cache.put(frame_count, None)  # キャッシュを無効化
+                        self.frame_cache.put(frame_count, None)
                         cached_frame = None
                         consecutive_cached_frames = 0
                     
@@ -868,19 +1014,17 @@ class ProcessThread(QThread):
                 elapsed = time.time() - start_time - total_pause_duration
                 wait_time = target_time - elapsed
                 
-                # 負のwait_time（遅延）が大きすぎる場合はスキップ
-                if wait_time < -0.5:  # 500ms以上遅れている場合
+                if wait_time < -0.5:
                     print(f"[WARNING] フレーム遅延検出: {wait_time:.3f}s, スキップ調整")
                     start_time = time.time() - (frames_since_reset * frame_interval)
                     total_pause_duration = 0
                     wait_time = 0
                 
                 if wait_time > 0:
-                    time.sleep(min(wait_time, 0.1))  # 最大100msまでスリープ
+                    time.sleep(min(wait_time, 0.1))
                 
                 self.frame_ready.emit(final_frame, frame_count, is_cached)
                 
-                # 音声同期処理: 10秒に一度同期を試みる
                 if self.audio_thread and frame_count % (int(self.video_fps) * 10) == 0:
                     current_sec = frame_count / self.video_fps
                     self.audio_thread.seek_to_time(current_sec)
@@ -888,7 +1032,6 @@ class ProcessThread(QThread):
                 frame_count += 1
                 self.progress_updated.emit(frame_count, self.total_frames)
                 
-                # FPS表示の頻度を調整 (15フレームごとに更新)
                 if frame_count % 15 == 0:
                     elapsed = time.time() - start_time - total_pause_duration
                     actual_fps = (frame_count - self.start_frame) / elapsed if elapsed > 0 else 0
@@ -914,7 +1057,7 @@ class ProcessThread(QThread):
                     pass
             self.is_running = False
             if self.audio_thread:
-                self.audio_thread.stop_playback() # スレッド終了時に音声停止
+                self.audio_thread.stop_playback()
     
     def stop(self):
         self._stop_flag = True
@@ -928,8 +1071,6 @@ class ProcessThread(QThread):
 
 
 class AudioThread(QThread):
-    """VLCを使用した音声再生を制御するスレッド"""
-    
     def __init__(self, vlc_instance, initial_volume=100, is_muted=False):
         super().__init__()
         self.vlc_instance = vlc_instance
@@ -937,33 +1078,29 @@ class AudioThread(QThread):
         self._stop_flag = False
         self._is_paused = True
         self.volume = initial_volume
-        self.user_muted = is_muted      # ユーザーによるミュート状態
-        self.internal_muted = False     # 内部都合によるミュート状態 (新規追加)
+        self.user_muted = is_muted
+        self.internal_muted = False
         
         self.player.audio_set_volume(self.volume)
-        self._update_vlc_mute_state()   # 新しいロジックで初期設定を適用
+        self._update_vlc_mute_state()
         
-        print(f"[DEBUG] AudioThread初期化: Volume={self.volume}, Mute={self.user_muted} (Internal:{self.internal_muted})")
+        print(f"[DEBUG] AudioThread初期化: Volume={self.volume}, Mute={self.user_muted}")
 
     def run(self):
-        # メインスレッドで制御を行うため、このスレッドは基本的に待機
         while not self._stop_flag:
             time.sleep(0.1)
 
     def _update_vlc_mute_state(self):
-        """ユーザーミュートと内部ミュートの論理和に基づいてVLCのミュート状態を更新する"""
         if not VLC_AVAILABLE:
             return
-        # ユーザーミュート OR 内部ミュート のいずれかがTrueならミュート
         should_be_muted = self.user_muted or self.internal_muted
         self.player.audio_set_mute(should_be_muted)
 
     def set_internal_mute(self, is_muted):
-        """内部ミュートの設定"""
         if not VLC_AVAILABLE:
             return
         self.internal_muted = is_muted
-        self._update_vlc_mute_state() 
+        self._update_vlc_mute_state()
         print(f"[DEBUG] 内部ミュート設定: {is_muted}")
         
     def start_playback(self, video_path, start_sec=0.0):
@@ -977,30 +1114,21 @@ class AudioThread(QThread):
         
         print(f"[DEBUG] 音声再生開始: {video_path} から {start_sec:.2f}秒")
         
-        # 1. 内部ミュートをONにする (音声漏れ防止)
-        self.set_internal_mute(True) 
-        
-        # 2. play()でストリームを初期化 (再生開始)
+        self.set_internal_mute(True)
         self.player.play()
-        
-        # 3. VLCの起動を待つ
-        time.sleep(0.01) 
+        time.sleep(0.01)
         
         if start_sec > 0.0:
-            # 4. プレイヤーが再生状態になるのを待つ
-            for _ in range(10): 
+            for _ in range(10):
                 if self.player.get_state() in (vlc.State.Playing, vlc.State.Paused):
                     break
                 time.sleep(0.05)
             
-            # 5. 正しい位置にシーク
             if self.player.is_seekable():
                 self.player.set_time(msec)
                 print(f"[DEBUG] 音声シーク(初期): {msec}ms")
 
-        # 6. 内部ミュートをOFFにする (シーク完了後のタイミング)
-        self.set_internal_mute(False) 
-        
+        self.set_internal_mute(False)
         self._is_paused = False
         
     def stop_playback(self):
@@ -1025,10 +1153,9 @@ class AudioThread(QThread):
             
         print(f"[DEBUG] 音声再生再開: {start_sec:.2f}秒へシーク")
         self.seek_to_time(start_sec)
-        self.player.play() # play()は一時停止状態から再開する
+        self.player.play()
         self._is_paused = False
-        # ユーザーミュート設定を再適用
-        self._update_vlc_mute_state() # 内部ミュート状態を考慮して更新
+        self._update_vlc_mute_state()
 
     def seek_to_time(self, seconds):
         if not VLC_AVAILABLE:
@@ -1036,11 +1163,9 @@ class AudioThread(QThread):
             
         msec = int(seconds * 1000)
         
-        # 1. 内部ミュートON (シーク中の音声漏れ防止)
         self.set_internal_mute(True)
         
-        # 再生可能状態になるまで待つ（重要）
-        for _ in range(10): 
+        for _ in range(10):
             if self.player.get_state() in (vlc.State.Playing, vlc.State.Paused):
                 break
             time.sleep(0.1)
@@ -1049,7 +1174,6 @@ class AudioThread(QThread):
             self.player.set_time(msec)
             print(f"[DEBUG] 音声シーク: {msec}ms")
         
-        # 2. 内部ミュートOFF
         self.set_internal_mute(False)
 
     def set_volume(self, volume):
@@ -1060,29 +1184,33 @@ class AudioThread(QThread):
         print(f"[DEBUG] 音量設定: {self.volume}")
 
     def toggle_mute(self, is_muted):
-        """ユーザーによるミュート切り替え"""
         if not VLC_AVAILABLE:
             return
         self.user_muted = is_muted
-        self._update_vlc_mute_state() # 内部ミュート状態を考慮して更新
+        self._update_vlc_mute_state()
         print(f"[DEBUG] ユーザーミュート設定: {is_muted}")
 
     def stop(self):
-        """スレッド停止"""
         self._stop_flag = True
         self.stop_playback()
-        # super().stop() を削除 - これは不要です
+
 
 class LadaFinalPlayer(QMainWindow):
     def __init__(self):
         super().__init__()
         
-        # D&Dを有効化
         self.setAcceptDrops(True)
         
         self.settings = self.load_settings()
-        self.frame_cache = FrameCache(max_size_mb=self.settings.get('cache_size_mb', 12288))
-        self.process_thread = None
+        
+        # チャンクキャッシュで初期化
+        chunk_frames = self.settings.get('chunk_frames', 150)
+        cache_size_mb = self.settings.get('cache_size_mb', 12288)
+        self.frame_cache = ChunkBasedCache(
+            max_size_mb=cache_size_mb, 
+            chunk_frames=chunk_frames
+        )
+        
         self.current_video = None
         self.total_frames = 0
         self.current_frame = 0
@@ -1092,6 +1220,9 @@ class LadaFinalPlayer(QMainWindow):
         self.thread_counter = 0
         self._seeking = False
         self.ai_processing_enabled = True
+        
+        # process_threadをNoneで明示的に初期化
+        self.process_thread = None
         
         # VLCの初期化
         self.vlc_instance = vlc.Instance('--no-video') if VLC_AVAILABLE else None
@@ -1128,13 +1259,13 @@ class LadaFinalPlayer(QMainWindow):
             'queue_size_mb': 12288,
             'max_clip_length': 8,
             'cache_size_mb': 12288,
+            'chunk_frames': 150,
             'audio_volume': 100, 
             'audio_muted': False
         }
 
     def save_settings(self):
         if self.audio_thread:
-            # 現在の音量を保存（ミュート中でない場合）
             if not self.audio_thread.user_muted:
                 self.settings['audio_volume'] = self.audio_thread.volume
             self.settings['audio_muted'] = self.audio_thread.user_muted
@@ -1147,7 +1278,7 @@ class LadaFinalPlayer(QMainWindow):
             print(f"[ERROR] 設定保存失敗: {e}")
 
     def init_ui(self):
-        self.setWindowTitle("LADA REALTIME PLAYER V0.9")
+        self.setWindowTitle("LADA REALTIME PLAYER V1.0")
         self.setGeometry(100, 100, 1200, 850)
         
         central = QWidget()
@@ -1270,14 +1401,13 @@ class LadaFinalPlayer(QMainWindow):
         info.setReadOnly(True)
         info.setMaximumHeight(100)
         info.setText("""
-V0.9 - 30FPS最適化: 
-操作: F=全画面 | ESC=通常 | Space=再生/停止 | M=ミュートトグル | X=AI処理トグル | 進捗バークリックでシーク
-最適化: バッチ16, キュー12GB, クリップ長8 で30FPS目標
+V1.0 : 
+操作: F=フルスクリーントグル | Space=再生/停止 | M=ミュートトグル | X=AI処理トグル | 進捗バークリックでシーク
 """)
         layout.addWidget(info)
         
         self.setup_shortcuts()
-        print("[INFO] 初期化完了 - 30FPS最適化版")
+        print("[INFO] 初期化完了")
         
         if self.audio_thread:
             initial_volume_thread = self.settings.get('audio_volume', 100)
@@ -1323,7 +1453,6 @@ V0.9 - 30FPS最適化:
         print("[INFO] ショートカット設定完了")
 
     def toggle_mute_shortcut(self):
-        """Mキーでのミュートトグル - 音量復元を修正"""
         if self.audio_thread:
             new_mute_state = not self.audio_thread.user_muted
             self.audio_thread.toggle_mute(new_mute_state)
@@ -1331,12 +1460,10 @@ V0.9 - 30FPS最適化:
             self.mute_btn.setText("🔇" if new_mute_state else "🔊")
             
             if new_mute_state:
-                # ミュート時：現在の音量を保存して0に設定
                 self.settings['last_volume'] = self.audio_thread.volume
                 self.volume_slider.setValue(0)
                 print(f"[DEBUG] ミュートON: 音量{self.settings['last_volume']}を保存")
             else:
-                # ミュート解除時：保存した音量か設定ファイルの音量を復元
                 unmuted_volume = self.settings.get('last_volume', self.settings.get('audio_volume', 100))
                 if isinstance(unmuted_volume, float):
                     unmuted_volume = int(unmuted_volume * 100)
@@ -1350,18 +1477,15 @@ V0.9 - 30FPS最適化:
             print(f"[DEBUG] ミュートトグル: {'ON' if new_mute_state else 'OFF'}")
 
     def toggle_user_mute(self, checked):
-        """ユーザーによるミュート切り替え - 音量復元を修正"""
         if self.audio_thread:
             self.audio_thread.toggle_mute(checked)
             self.mute_btn.setText("🔇" if checked else "🔊")
             
             if checked:
-                # ミュート時：現在の音量を保存
                 self.settings['last_volume'] = self.audio_thread.volume
                 self.volume_slider.setValue(0)
                 print(f"[DEBUG] ミュートON(ボタン): 音量{self.settings['last_volume']}を保存")
             else:
-                # ミュート解除時：保存した音量を復元
                 unmuted_volume = self.settings.get('last_volume', self.settings.get('audio_volume', 100))
                 if isinstance(unmuted_volume, float):
                     unmuted_volume = int(unmuted_volume * 100)
@@ -1374,23 +1498,19 @@ V0.9 - 30FPS最適化:
             self.save_audio_settings()
 
     def set_volume_slider(self, value):
-        """ボリュームスライダー操作時 - ミュート状態を考慮"""
         if self.audio_thread:
             self.audio_thread.set_volume(value)
             
-            # 音量が0より大きい場合はミュート解除
             if value > 0 and self.audio_thread.user_muted:
                 self.audio_thread.toggle_mute(False)
                 self.mute_btn.setChecked(False)
                 self.mute_btn.setText("🔊")
                 print(f"[DEBUG] スライダー操作でミュート解除: 音量{value}")
             
-            # 現在の音量を設定に保存（ミュート解除用）
             self.settings['audio_volume'] = value
             self.save_audio_settings()
 
     def toggle_ai_processing(self):
-        """XキーでのAI処理トグル - 確実に切り替え"""
         self.ai_processing_enabled = not self.ai_processing_enabled
         
         if self.ai_processing_enabled:
@@ -1404,22 +1524,17 @@ V0.9 - 30FPS最適化:
             self.mode_label.setText("📊 モード: 🎥 原画再生")
             print("[DEBUG] AI処理: 無効 (原画再生)")
         
-        # 現在再生中の場合は完全に停止してから再開
         if self.current_video:
             current_frame = self.current_frame
             print(f"[DEBUG] モード切替: フレーム{current_frame}から再開")
             
-            # 完全停止
             self.full_stop()
-            
-            # 状態をリセット
             self.is_playing = False
             self.is_paused = False
             
             QApplication.processEvents()
-            time.sleep(0.2)  # 確実に停止するまで待機
+            time.sleep(0.2)
             
-            # 新しいモードで再生開始
             self.start_processing_from_frame(current_frame)
 
     def dragEnterEvent(self, event: QDragEnterEvent):
@@ -1452,7 +1567,7 @@ V0.9 - 30FPS最適化:
 
     def update_stats(self):
         stats = self.frame_cache.get_stats()
-        self.cache_label.setText(f"💾 キャッシュ: {stats['size_mb']:.1f} MB ({stats['count']} frames)")
+        self.cache_label.setText(f"💾 キャッシュ: {stats['size_mb']:.1f}MB ({stats['chunk_count']}chunks, {stats['total_frames']}f)")
 
     def format_time(self, seconds):
         h = int(seconds // 3600)
@@ -1464,6 +1579,9 @@ V0.9 - 30FPS最適化:
         if self.process_thread and thread_id == self.process_thread.thread_id:
             self.current_frame = frame_num
             self.video_widget.update_frame(frame)
+            
+            # キャッシュに再生位置を通知
+            self.frame_cache.update_playhead(frame_num)
             
             current_sec = frame_num / self.video_fps if self.video_fps > 0 else 0
             total_sec = self.total_frames / self.video_fps if self.video_fps > 0 else 0
@@ -1541,6 +1659,9 @@ V0.9 - 30FPS最適化:
         self.progress_bar.setValue(target_frame)
         self.video_widget.update_progress(target_frame)
         
+        # キャッシュに再生位置を通知
+        self.frame_cache.update_playhead(target_frame)
+        
         frame_data = self.frame_cache.get(target_frame)
         if frame_data is not None:
             self.video_widget.update_frame(frame_data)
@@ -1572,23 +1693,61 @@ V0.9 - 30FPS最適化:
         if dialog.exec() == QDialog.DialogCode.Accepted:
             new_settings = dialog.get_settings()
             
-            if (new_settings.get('batch_size') != self.settings.get('batch_size') or 
-                new_settings.get('queue_size_mb') != self.settings.get('queue_size_mb') or 
-                new_settings.get('max_clip_length') != self.settings.get('max_clip_length') or
-                new_settings.get('cache_size_mb') != self.settings.get('cache_size_mb')):
-                
+            # 変更検出フラグ
+            needs_restart = False
+            needs_cache_rebuild = False
+            
+            # キャッシュ構造に影響する設定変更を検出
+            cache_related_settings = [
+                'batch_size', 'queue_size_mb', 'max_clip_length',
+                'cache_size_mb', 'chunk_frames'
+            ]
+            
+            for key in cache_related_settings:
+                if new_settings.get(key) != self.settings.get(key):
+                    needs_restart = True
+                    if key == 'chunk_frames':
+                        needs_cache_rebuild = True
+                        print(f"[INFO] チャンクサイズ変更: {self.settings.get(key)} → {new_settings.get(key)}")
+                    break
+            
+            if needs_restart:
                 self.settings.update(new_settings)
                 self.save_settings()
 
                 print("[INFO] 設定変更 - 完全リセット実行")
                 self.full_stop()
-                self.frame_cache = FrameCache(max_size_mb=self.settings['cache_size_mb'])
+                
+                # チャンクサイズ変更時はキャッシュ再構築
+                if needs_cache_rebuild:
+                    print(f"[INFO] キャッシュ再構築: {self.settings['chunk_frames']}フレーム/チャンク")
+                    self.frame_cache = ChunkBasedCache(
+                        max_size_mb=self.settings['cache_size_mb'],
+                        chunk_frames=self.settings['chunk_frames']
+                    )
+                else:
+                    # その他の設定変更時は既存キャッシュを維持
+                    self.frame_cache = ChunkBasedCache(
+                        max_size_mb=self.settings['cache_size_mb'],
+                        chunk_frames=self.settings.get('chunk_frames', 150)
+                    )
                 
                 if self.current_video:
                     self.load_video(self.current_video)
                 
+                # ユーザーに通知
+                msg = QMessageBox(self)
+                msg.setWindowTitle("設定変更")
+                if needs_cache_rebuild:
+                    msg.setText("キャッシュ設定を変更しました。\nキャッシュを再構築します。")
+                else:
+                    msg.setText("処理設定を変更しました。\n再生を再開します。")
+                msg.setIcon(QMessageBox.Icon.Information)
+                msg.exec()
+                
                 print(f"[INFO] 新設定適用完了: {self.settings}")
             else:
+                # 音声設定など軽微な変更
                 self.settings.update(new_settings)
                 self.save_settings()
 
@@ -1664,7 +1823,7 @@ V0.9 - 30FPS最適化:
         print(f"[DEBUG] フレーム{start_frame}から再生開始 (AI処理: {self.ai_processing_enabled})")
         
         # 既存のスレッド/タイマーが残っていないか確認
-        if self.process_thread and self.process_thread.isRunning():
+        if hasattr(self, 'process_thread') and self.process_thread and self.process_thread.isRunning():
             print("[WARNING] 既存のAIスレッドが動作中です。強制停止します。")
             self.full_stop()
             QApplication.processEvents()
@@ -1733,7 +1892,7 @@ V0.9 - 30FPS最適化:
         print(f"[DEBUG] AI処理スレッド開始完了: ID{current_id}")
 
     def start_original_playback(self, start_frame):
-        """AI処理無効時の元動画再生 - 確実に単一インスタンスのみ"""
+        """AI処理無効時の元動画再生"""
         print(f"[DEBUG] 原画再生開始: フレーム{start_frame}")
         
         # 既存のキャプチャとタイマーを確実にクリーンアップ
@@ -1775,6 +1934,9 @@ V0.9 - 30FPS最適化:
         self.mode_label.setText("📊 モード: 🎥 原画再生")
         self.video_widget.set_progress_bar_color('#00ff00')
         
+        # キャッシュに再生位置を通知
+        self.frame_cache.update_playhead(start_frame)
+        
         # 音声再生開始
         if self.audio_thread:
             start_sec = start_frame / self.video_fps if self.video_fps > 0 else 0
@@ -1792,6 +1954,10 @@ V0.9 - 30FPS最適化:
             self.current_frame += 1
             self.progress_bar.setValue(self.current_frame)
             self.video_widget.update_progress(self.current_frame)
+            
+            # キャッシュに再生位置を通知
+            if self.current_frame % 30 == 0:
+                self.frame_cache.update_playhead(self.current_frame)
             
             current_sec = self.current_frame / self.video_fps if self.video_fps > 0 else 0
             total_sec = self.total_frames / self.video_fps if self.video_fps > 0 else 0
@@ -1871,8 +2037,8 @@ V0.9 - 30FPS最適化:
             self.original_capture = None
             print("[DEBUG] 原画キャプチャ解放")
         
-        # AI処理スレッドの停止（強制的に）
-        if self.process_thread:
+        # AI処理スレッドの停止（存在する場合のみ）
+        if hasattr(self, 'process_thread') and self.process_thread:
             print("[DEBUG] AI処理スレッド停止中...")
             # フラグ設定
             self.process_thread._stop_flag = True
@@ -1903,6 +2069,8 @@ V0.9 - 30FPS最適化:
             
             self.process_thread = None
             print("[DEBUG] AI処理スレッド停止完了")
+        else:
+            print("[DEBUG] 停止するAIスレッドはありません")
         
         # 音声停止
         if self.audio_thread:
@@ -1914,8 +2082,9 @@ V0.9 - 30FPS最適化:
         self.play_pause_btn.setEnabled(self.current_video is not None)
         
         QApplication.processEvents()
-        time.sleep(0.1)  # 少し長めに待機
+        time.sleep(0.1)
         print("[DEBUG] 完全停止完了")
+
 
 def main():
     app = QApplication(sys.argv)
