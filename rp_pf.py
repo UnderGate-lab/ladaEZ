@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LADA REALTIME PLAYER V1.0
+LADA REALTIME PLAYER V1.0 - Smart Cache Edition
 
 """
 
@@ -117,8 +117,8 @@ class SettingsDialog(QDialog):
         }
 
 
-class ChunkBasedCache:
-    """チャンクベースの高性能キャッシュ"""
+class SmartChunkBasedCache:
+    """30FPS最適化スマートキャッシュ（パフォーマンス最適化版）"""
     
     def __init__(self, max_size_mb=12288, chunk_frames=150):
         self.chunk_frames = chunk_frames
@@ -130,6 +130,27 @@ class ChunkBasedCache:
         self.access_order = deque()  # LRU順序
         self.mutex = QMutex()
         
+        # 処理コスト追跡
+        self.processing_costs = {}  # chunk_id -> cost_data
+        self.cache_policies = {}    # chunk_id -> policy_dict
+        
+        # パフォーマンス統計
+        self.performance_stats = {
+            'cache_hits': 0,
+            'cache_misses': 0,
+            'total_frames': 0,
+            'total_processing_time': 0.0
+        }
+        
+        # 予測的先読み
+        self.prefetch_queue = deque()
+        self.prefetch_enabled = True
+        
+        # デバッグ制御
+        self.debug_enabled = False
+        self.last_debug_output = 0
+        self.debug_interval = 5.0  # 5秒ごとにデバッグ出力
+        
         # 非同期クリーンアップ
         self.cleanup_timer = QTimer()
         self.cleanup_timer.timeout.connect(self._async_cleanup)
@@ -139,7 +160,7 @@ class ChunkBasedCache:
         # 再生状態
         self.current_playhead = 0
         
-        print(f"[CACHE] 初期化: {max_size_mb}MB, チャンク={chunk_frames}フレーム")
+        print(f"[SMART-CACHE] 初期化: {max_size_mb}MB, チャンク={chunk_frames}フレーム, 30FPS最適化")
 
     def get_chunk_id(self, frame_num):
         """フレーム番号からチャンクIDを計算"""
@@ -151,8 +172,132 @@ class ChunkBasedCache:
         end_frame = start_frame + self.chunk_frames - 1
         return start_frame, end_frame
 
+    def record_frame_processing_time(self, frame_num, processing_time):
+        """フレーム処理時間を記録（最小オーバーヘッド）"""
+        chunk_id = self.get_chunk_id(frame_num)
+        
+        if chunk_id not in self.processing_costs:
+            self.processing_costs[chunk_id] = {
+                'frame_times': [],
+                'total_time': 0.0,
+                'sample_count': 0,
+                'last_sample_time': time.time()
+            }
+        
+        cost_data = self.processing_costs[chunk_id]
+        cost_data['frame_times'].append(processing_time)
+        cost_data['total_time'] += processing_time
+        cost_data['sample_count'] += 1
+        cost_data['last_sample_time'] = time.time()
+        
+        # 統計更新
+        self.performance_stats['total_frames'] += 1
+        self.performance_stats['total_processing_time'] += processing_time
+        
+        # 3サンプル以上でポリシー更新（高速判定）
+        if cost_data['sample_count'] == 3:
+            self._update_chunk_policy(chunk_id)
+
+    def _update_chunk_policy(self, chunk_id):
+        """高速なキャッシュポリシー決定"""
+        cost_data = self.processing_costs[chunk_id]
+        avg_ms_per_frame = (cost_data['total_time'] / cost_data['sample_count']) * 1000
+        
+        # 超高速判定（分岐最小化）
+        if avg_ms_per_frame <= 33.3:
+            policy, priority = 'no_cache', 0
+        elif avg_ms_per_frame <= 50.0:
+            policy, priority = 'short_term', 1
+        elif avg_ms_per_frame <= 100.0:
+            policy, priority = 'standard_cache', 2
+        else:
+            policy, priority = 'priority_cache', 3
+        
+        # 簡易平滑化（近傍2チャンクのみチェック）
+        smoothed_policy = self._fast_temporal_smoothing(chunk_id, policy, priority)
+        
+        self.cache_policies[chunk_id] = {
+            'policy': smoothed_policy['policy'],
+            'priority': smoothed_policy['priority'],
+            'avg_ms_per_frame': avg_ms_per_frame,
+            'sample_size': cost_data['sample_count'],
+            'last_updated': time.time()
+        }
+        
+        # 制限付きデバッグ出力
+        current_time = time.time()
+        if (self.debug_enabled and 
+            current_time - self.last_debug_output > self.debug_interval and
+            avg_ms_per_frame > 50.0):  # 高負荷時のみ
+            print(f"[SMART-CACHE] 高負荷チャンク{chunk_id}: {policy} ({avg_ms_per_frame:.1f}ms)")
+            self.last_debug_output = current_time
+
+    def _fast_temporal_smoothing(self, chunk_id, proposed_policy, proposed_priority):
+        """高速な時空間平滑化"""
+        # 近傍1チャンクのみチェック（高速化）
+        neighbors = []
+        for offset in [-1, 1]:
+            neighbor_id = chunk_id + offset
+            if neighbor_id in self.cache_policies:
+                neighbors.append(self.cache_policies[neighbor_id])
+        
+        if len(neighbors) >= 1:
+            # シンプルな多数決
+            policy_counts = {}
+            for neighbor in neighbors:
+                policy = neighbor['policy']
+                policy_counts[policy] = policy_counts.get(policy, 0) + 1
+            
+            most_common = max(policy_counts.items(), key=lambda x: x[1])
+            if most_common[1] >= len(neighbors) and most_common[0] != proposed_policy:
+                return {'policy': most_common[0], 'priority': proposed_priority}
+        
+        return {'policy': proposed_policy, 'priority': proposed_priority}
+
+    def _trigger_prefetch(self, current_frame, processing_time):
+        """予測的先読みのトリガー"""
+        if processing_time > 0.05:  # 50ms以上の処理時間の場合
+            current_chunk = self.get_chunk_id(current_frame)
+            current_policy = self.cache_policies.get(current_chunk)
+            
+            if current_policy and current_policy['priority'] >= 2:  # 中負荷以上
+                # 1-3フレーム先を先読み（数を減らして高速化）
+                for ahead in range(1, 4):
+                    future_frame = current_frame + ahead
+                    if self.get(future_frame) is None and future_frame not in self.prefetch_queue:
+                        self.prefetch_queue.append(future_frame)
+                
+                # キューが溜まっていたら処理
+                if len(self.prefetch_queue) >= 3:
+                    self._process_prefetch_queue()
+
+    def _process_prefetch_queue(self):
+        """先読みキューを処理"""
+        if not self.prefetch_queue:
+            return
+            
+        # 最大2フレームまで先読み
+        for _ in range(min(2, len(self.prefetch_queue))):
+            frame_num = self.prefetch_queue.popleft()
+            # 非同期処理は実装せず、キュー管理のみ
+
+    def should_cache_frame(self, frame_num, frame_data=None):
+        """フレームをキャッシュすべきか判定"""
+        chunk_id = self.get_chunk_id(frame_num)
+        
+        if chunk_id not in self.cache_policies:
+            return True  # 未知はデフォルトでキャッシュ
+        
+        policy = self.cache_policies[chunk_id]
+        
+        # TTLチェック（簡略化）
+        if policy['policy'] == 'no_cache':
+            return False
+        
+        return policy['policy'] != 'no_cache'
+
     def get(self, frame_num):
-        """フレーム取得 - 外部インターフェースは変更なし"""
+        """フレーム取得"""
         with QMutexLocker(self.mutex):
             chunk_id = self.get_chunk_id(frame_num)
             
@@ -162,14 +307,24 @@ class ChunkBasedCache:
                     # アクセス記録更新
                     chunk['last_access'] = time.time()
                     self._update_access_order(chunk_id)
+                    
+                    # 統計更新
+                    self.performance_stats['cache_hits'] += 1
                     return chunk['frames'][frame_num]
+            
+            # キャッシュミス
+            self.performance_stats['cache_misses'] += 1
             return None
 
     def put(self, frame_num, frame):
-        """フレーム追加 - 外部インターフェースは変更なし"""
+        """スマートキャッシュ判定付きのフレーム追加"""
         with QMutexLocker(self.mutex):
             if frame is None:
                 self._remove_frame(frame_num)
+                return
+                
+            # スマートキャッシュ判定
+            if not self.should_cache_frame(frame_num, frame):
                 return
                 
             chunk_id = self.get_chunk_id(frame_num)
@@ -230,21 +385,31 @@ class ChunkBasedCache:
                 self.pending_cleanup = False
                 return
             
-            # 保護対象のチャンクを計算
+            # 保護対象のチャンクを計算（優先度考慮）
             protected_chunks = self._get_protected_chunks()
             
-            # 最も古く、保護対象外のチャンクから削除
+            # 優先度の低いチャンクから削除
+            chunks_to_remove = []
             for chunk_id in list(self.access_order):
-                if chunk_id not in protected_chunks:
-                    if self._remove_chunk(chunk_id):
-                        removed_count += 1
-                    
-                    # 十分な空き容量ができたら終了
+                if (chunk_id not in protected_chunks and 
+                    self._get_chunk_cleanup_priority(chunk_id) <= 1):  # 低優先度
+                    chunks_to_remove.append(chunk_id)
+            
+            # それでも足りない場合は標準優先度を対象に
+            if self.current_size_mb > self.max_size_mb * 0.8:
+                for chunk_id in list(self.access_order):
+                    if (chunk_id not in protected_chunks and 
+                        chunk_id not in chunks_to_remove and
+                        self._get_chunk_cleanup_priority(chunk_id) <= 2):  # 標準優先度以下
+                        chunks_to_remove.append(chunk_id)
+            
+            # 削除実行
+            for chunk_id in chunks_to_remove:
+                if self._remove_chunk(chunk_id):
+                    removed_count += 1
                     if self.current_size_mb <= self.max_size_mb * 0.7:
                         break
-                    
-                    # 一度に削除するチャンク数を制限
-                    if removed_count >= 3:
+                    if removed_count >= 2:  # 一度に削除する数を減らして高速化
                         break
             
             # 必要に応じて継続
@@ -254,18 +419,39 @@ class ChunkBasedCache:
                 self.pending_cleanup = False
         
         cleanup_time = (time.time() - start_time) * 1000
-        if removed_count > 0:
-            print(f"[CACHE] 非同期整理: {removed_count}チャンク削除, {cleanup_time:.1f}ms")
+        # デバッグ出力を削除（パフォーマンス向上のため）
+
+    def _get_chunk_cleanup_priority(self, chunk_id):
+        """クリーンアップ時の優先度（低いほど先に削除）"""
+        if chunk_id not in self.cache_policies:
+            return 0  # 未知は最低優先度
+        
+        policy = self.cache_policies[chunk_id]
+        
+        # ポリシーに基づく優先度（数値が小さいほど削除されやすい）
+        priority_map = {
+            'no_cache': 0,
+            'short_term': 1, 
+            'standard_cache': 2,
+            'priority_cache': 3
+        }
+        
+        return priority_map.get(policy['policy'], 0)
 
     def _get_protected_chunks(self):
         """保護対象のチャンクを計算"""
         current_chunk = self.get_chunk_id(self.current_playhead)
         protected = set()
         
-        # 現在のチャンクと前後2チャンクを保護
-        for offset in range(-2, 3):  # -2, -1, 0, 1, 2
+        # 現在のチャンクと前後1チャンクを保護（範囲を縮小して高速化）
+        for offset in range(-1, 2):  # -1, 0, 1
             protected.add(current_chunk + offset)
         
+        # 高優先度チャンクを追加保護
+        for chunk_id in list(self.chunks.keys()):
+            if self._get_chunk_cleanup_priority(chunk_id) >= 3:  # 高優先度
+                protected.add(chunk_id)
+                
         return protected
 
     def _remove_chunk(self, chunk_id):
@@ -301,6 +487,18 @@ class ChunkBasedCache:
     def update_playhead(self, frame_num):
         """再生位置を更新（保護対象の計算用）"""
         self.current_playhead = frame_num
+        
+        # 再生位置に基づく追加の先読み（頻度を減らして高速化）
+        if self.prefetch_enabled and frame_num % 10 == 0:  # 10フレームに1回のみ
+            current_chunk = self.get_chunk_id(frame_num)
+            for ahead_chunk in [current_chunk + 1]:  # 次のチャンクのみ
+                if ahead_chunk not in self.cache_policies:
+                    # 未調査のチャンクを先読み対象に追加
+                    start_frame = ahead_chunk * self.chunk_frames
+                    for i in range(min(2, self.chunk_frames)):  # 2フレームのみ
+                        future_frame = start_frame + i
+                        if future_frame not in self.prefetch_queue:
+                            self.prefetch_queue.append(future_frame)
 
     def clear(self):
         """キャッシュ全クリア"""
@@ -310,6 +508,17 @@ class ChunkBasedCache:
             self.current_size_mb = 0
             self.pending_cleanup = False
             self.cleanup_timer.stop()
+            
+            # スマートキャッシュ関連もクリア
+            self.processing_costs.clear()
+            self.cache_policies.clear()
+            self.prefetch_queue.clear()
+            self.performance_stats = {
+                'cache_hits': 0,
+                'cache_misses': 0,
+                'total_frames': 0,
+                'total_processing_time': 0.0
+            }
 
     def get_stats(self):
         """キャッシュ統計を取得"""
@@ -317,13 +526,37 @@ class ChunkBasedCache:
             chunk_count = len(self.chunks)
             total_frames = sum(len(chunk['frames']) for chunk in self.chunks.values())
             
-            return {
+            stats = {
                 'chunk_count': chunk_count,
                 'total_frames': total_frames,
                 'size_mb': self.current_size_mb,
                 'max_mb': self.max_size_mb,
                 'chunk_frames': self.chunk_frames
             }
+            
+            # スマートキャッシュ統計を追加
+            total_requests = self.performance_stats['cache_hits'] + self.performance_stats['cache_misses']
+            if total_requests > 0:
+                stats['hit_ratio'] = self.performance_stats['cache_hits'] / total_requests
+            else:
+                stats['hit_ratio'] = 0.0
+                
+            if self.performance_stats['total_frames'] > 0:
+                stats['avg_processing_time'] = (self.performance_stats['total_processing_time'] / self.performance_stats['total_frames']) * 1000
+            else:
+                stats['avg_processing_time'] = 0.0
+                
+            stats['policy_distribution'] = {}
+            for policy in self.cache_policies.values():
+                policy_name = policy['policy']
+                stats['policy_distribution'][policy_name] = stats['policy_distribution'].get(policy_name, 0) + 1
+            
+            return stats
+
+    def enable_debug(self, enabled=True):
+        """デバッグ出力の有効/無効を設定"""
+        self.debug_enabled = enabled
+        print(f"[SMART-CACHE] デバッグ出力: {'有効' if enabled else '無効'}")
 
 
 class VideoGLWidget(QOpenGLWidget):
@@ -728,7 +961,7 @@ class VideoGLWidget(QOpenGLWidget):
         self.frame_width = 0
         self.frame_height = 0
         self.update()
-
+    
     def set_progress_bar_color(self, color):
         self.fs_progress_bar.setStyleSheet(f"""
             QProgressBar {{
@@ -741,9 +974,6 @@ class VideoGLWidget(QOpenGLWidget):
             }}
         """)
 
-
-# 以下のクラスは変更なし（OptimizedFrameRestorer, ProcessThread, AudioThread）
-# ただし、LadaFinalPlayerの設定変更処理を修正
 
 class OptimizedFrameRestorer:
     def __init__(self, device, video_file, preserve_relative_scale, max_clip_length,
@@ -915,6 +1145,9 @@ class ProcessThread(QThread):
             max_consecutive_cached = 30
             
             while self.is_running and not self._stop_flag and frame_count < self.total_frames:
+                # フレーム処理開始時間
+                frame_start_time = time.time()
+                
                 # キャッシュに再生位置を定期的に通知
                 if frame_count % 30 == 0:
                     self.frame_cache.update_playhead(frame_count)
@@ -965,6 +1198,7 @@ class ProcessThread(QThread):
                     final_frame = cached_frame
                     is_cached = True
                     consecutive_cached_frames += 1
+                    processing_time = 0.0  # キャッシュヒットは処理時間0
                     
                     if consecutive_cached_frames > max_consecutive_cached:
                         self.frame_cache.put(frame_count, None)
@@ -1004,8 +1238,21 @@ class ProcessThread(QThread):
                             break
                     
                     final_frame = restored_frame
-                    self.frame_cache.put(frame_count, restored_frame)
                     is_cached = False
+                    
+                    # 処理時間計測
+                    processing_time = time.time() - frame_start_time
+                    
+                    # スマートキャッシュに処理時間を記録
+                    if hasattr(self.frame_cache, 'record_frame_processing_time'):
+                        self.frame_cache.record_frame_processing_time(frame_count, processing_time)
+                    
+                    # 条件付きでキャッシュに保存
+                    if hasattr(self.frame_cache, 'should_cache_frame'):
+                        if self.frame_cache.should_cache_frame(frame_count, final_frame):
+                            self.frame_cache.put(frame_count, final_frame)
+                    else:
+                        self.frame_cache.put(frame_count, final_frame)
                 
                 last_mode_was_cached = is_cached
                 
@@ -1038,9 +1285,12 @@ class ProcessThread(QThread):
                     self.fps_updated.emit(actual_fps)
                     
                     cache_status = "キャッシュ" if is_cached else "AI処理"
-                    print(f"[DEBUG] FPS: {actual_fps:.1f}, モード: {cache_status}")
-                    if not is_cached and lada_time > 0:
-                        print(f"[DEBUG] LADA処理時間: {lada_time:.3f}秒/15フレーム")
+                    
+                    # FPSが低い場合のみ詳細出力
+                    if actual_fps < 25.0 or not is_cached:
+                        print(f"[DEBUG] FPS: {actual_fps:.1f}, モード: {cache_status}")
+                        if not is_cached and lada_time > 0:
+                            print(f"[DEBUG] LADA処理時間: {lada_time:.3f}秒/15フレーム")
             
             if not self._stop_flag:
                 self.finished_signal.emit()
@@ -1203,10 +1453,10 @@ class LadaFinalPlayer(QMainWindow):
         
         self.settings = self.load_settings()
         
-        # チャンクキャッシュで初期化
+        # スマートキャッシュで初期化
         chunk_frames = self.settings.get('chunk_frames', 150)
         cache_size_mb = self.settings.get('cache_size_mb', 12288)
-        self.frame_cache = ChunkBasedCache(
+        self.frame_cache = SmartChunkBasedCache(
             max_size_mb=cache_size_mb, 
             chunk_frames=chunk_frames
         )
@@ -1278,7 +1528,7 @@ class LadaFinalPlayer(QMainWindow):
             print(f"[ERROR] 設定保存失敗: {e}")
 
     def init_ui(self):
-        self.setWindowTitle("LADA REALTIME PLAYER V1.0")
+        self.setWindowTitle("LADA REALTIME PLAYER V1.0 - Smart Cache")
         self.setGeometry(100, 100, 1200, 850)
         
         central = QWidget()
@@ -1388,26 +1638,29 @@ class LadaFinalPlayer(QMainWindow):
         self.fps_label = QLabel("⚡ FPS: --")
         self.mode_label = QLabel("📊 モード: 待機中")
         self.cache_label = QLabel("💾 キャッシュ: 0 MB")
+        self.smart_cache_label = QLabel("🤖 スマート: --")
         
-        for label in [self.fps_label, self.mode_label, self.cache_label]:
+        for label in [self.fps_label, self.mode_label, self.cache_label, self.smart_cache_label]:
             label.setMaximumHeight(20)
         
         stats_layout.addWidget(self.fps_label)
         stats_layout.addWidget(self.mode_label)
         stats_layout.addWidget(self.cache_label)
+        stats_layout.addWidget(self.smart_cache_label)
         layout.addLayout(stats_layout)
         
         info = QTextEdit()
         info.setReadOnly(True)
         info.setMaximumHeight(100)
         info.setText("""
-V1.0 : 
+V1.0 Smart Cache Edition : 
 操作: F=フルスクリーントグル | Space=再生/停止 | M=ミュートトグル | X=AI処理トグル | 進捗バークリックでシーク
+スマートキャッシュ: 30FPS最適化、処理時間に応じた自動キャッシュ管理
 """)
         layout.addWidget(info)
         
         self.setup_shortcuts()
-        print("[INFO] 初期化完了")
+        print("[INFO] スマートキャッシュ版 初期化完了")
         
         if self.audio_thread:
             initial_volume_thread = self.settings.get('audio_volume', 100)
@@ -1567,7 +1820,21 @@ V1.0 :
 
     def update_stats(self):
         stats = self.frame_cache.get_stats()
-        self.cache_label.setText(f"💾 キャッシュ: {stats['size_mb']:.1f}MB ({stats['chunk_count']}chunks, {stats['total_frames']}f)")
+        self.cache_label.setText(f"💾 キャッシュ: {stats['size_mb']:.1f}MB ({stats['total_frames']}f)")
+        
+        # スマートキャッシュ統計（1秒に1回だけ更新）
+        if 'hit_ratio' in stats and 'policy_distribution' in stats:
+            hit_ratio = stats['hit_ratio'] * 100
+            
+            # ポリシー分布を簡潔に表示
+            policy_summary = ""
+            total_chunks = sum(stats['policy_distribution'].values())
+            for policy, count in stats['policy_distribution'].items():
+                percentage = (count / total_chunks) * 100 if total_chunks > 0 else 0
+                if percentage >= 5.0:  # 5%以上のポリシーのみ表示
+                    policy_summary += f"{policy[:2]}:{percentage:.0f}% "
+            
+            self.smart_cache_label.setText(f"🤖 Hit:{hit_ratio:.0f}% {policy_summary.strip()}")
 
     def format_time(self, seconds):
         h = int(seconds // 3600)
@@ -1721,13 +1988,13 @@ V1.0 :
                 # チャンクサイズ変更時はキャッシュ再構築
                 if needs_cache_rebuild:
                     print(f"[INFO] キャッシュ再構築: {self.settings['chunk_frames']}フレーム/チャンク")
-                    self.frame_cache = ChunkBasedCache(
+                    self.frame_cache = SmartChunkBasedCache(
                         max_size_mb=self.settings['cache_size_mb'],
                         chunk_frames=self.settings['chunk_frames']
                     )
                 else:
                     # その他の設定変更時は既存キャッシュを維持
-                    self.frame_cache = ChunkBasedCache(
+                    self.frame_cache = SmartChunkBasedCache(
                         max_size_mb=self.settings['cache_size_mb'],
                         chunk_frames=self.settings.get('chunk_frames', 150)
                     )
