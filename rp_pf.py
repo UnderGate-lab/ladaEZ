@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LADA REALTIME PLAYER V1.0 - Smart Cache Edition
+LADA REALTIME PLAYER V1.0 - Smart Cache Edition - 高速応答版
 
 """
 
@@ -1050,23 +1050,44 @@ class ProcessThread(QThread):
         self._stop_flag = False
         self.is_paused = False
         self.pause_mutex = QMutex()
+        self.pause_condition = QMutex()
         
         self.audio_thread = audio_thread
         self.video_fps = video_fps
         self.total_frames = 0
+        
+        # 高速シーク用の変数
+        self._seek_requested = False
+        self._seek_target = 0
+        self._seek_mutex = QMutex()
+        
+        # パフォーマンス計測
+        self.last_frame_time = time.time()
+        self.frame_times = deque(maxlen=30)
+    
+    def request_seek(self, target_frame):
+        """高速シークリクエスト"""
+        with QMutexLocker(self._seek_mutex):
+            self._seek_requested = True
+            self._seek_target = target_frame
+            print(f"[FAST-SEEK] シークリクエスト: フレーム{target_frame}")
     
     def pause(self):
+        """高速一時停止"""
         with QMutexLocker(self.pause_mutex):
             self.is_paused = True
             if self.audio_thread:
                 self.audio_thread.pause_audio()
+        print("[FAST-PAUSE] 一時停止完了")
     
     def resume(self):
+        """高速再開"""
         with QMutexLocker(self.pause_mutex):
             self.is_paused = False
             if self.audio_thread:
                 start_sec = self.start_frame / self.video_fps if self.video_fps > 0 else 0
                 self.audio_thread.resume_audio(start_sec)
+        print("[FAST-RESUME] 再開完了")
     
     def run(self):
         print(f"[DEBUG] スレッド{self.thread_id}開始:")
@@ -1145,6 +1166,42 @@ class ProcessThread(QThread):
             max_consecutive_cached = 30
             
             while self.is_running and not self._stop_flag and frame_count < self.total_frames:
+                # シークリクエストチェック（高速）
+                with QMutexLocker(self._seek_mutex):
+                    if self._seek_requested:
+                        frame_count = self._seek_target
+                        self.start_frame = frame_count
+                        start_ns = int((frame_count / self.video_fps) * 1_000_000_000)
+                        
+                        # フレームレストーラーを再起動
+                        try:
+                            self.frame_restorer.stop()
+                        except:
+                            pass
+                        
+                        self.frame_restorer.start(start_ns=start_ns)
+                        frame_restorer_iter = iter(self.frame_restorer)
+                        pending_ai_frame = None
+                        
+                        # 状態リセット
+                        start_time = time.time()
+                        total_pause_duration = 0
+                        frame_count_at_reset = frame_count
+                        last_mode_was_cached = False
+                        paused_cache_count = 0
+                        pause_start_time = 0
+                        
+                        # キャッシュに再生位置を通知
+                        self.frame_cache.update_playhead(frame_count)
+                        
+                        # 音声シーク
+                        if self.audio_thread:
+                            target_sec = frame_count / self.video_fps
+                            self.audio_thread.seek_to_time(target_sec)
+                        
+                        self._seek_requested = False
+                        print(f"[FAST-SEEK] シーク完了: フレーム{frame_count}")
+                
                 # フレーム処理開始時間
                 frame_start_time = time.time()
                 
@@ -1528,7 +1585,7 @@ class LadaFinalPlayer(QMainWindow):
             print(f"[ERROR] 設定保存失敗: {e}")
 
     def init_ui(self):
-        self.setWindowTitle("LADA REALTIME PLAYER V1.0 - Smart Cache")
+        self.setWindowTitle("LADA REALTIME PLAYER V1.0 - Smart Cache - 高速応答版")
         self.setGeometry(100, 100, 1200, 850)
         
         central = QWidget()
@@ -1653,14 +1710,14 @@ class LadaFinalPlayer(QMainWindow):
         info.setReadOnly(True)
         info.setMaximumHeight(100)
         info.setText("""
-V1.0 Smart Cache Edition : 
+V1.0 Smart Cache Edition - 高速応答版 : 
 操作: F=フルスクリーントグル | Space=再生/停止 | M=ミュートトグル | X=AI処理トグル | 進捗バークリックでシーク
-スマートキャッシュ: 30FPS最適化、処理時間に応じた自動キャッシュ管理
+高速シーク: キャッシュ優先、スレッド再利用による瞬時応答
 """)
         layout.addWidget(info)
         
         self.setup_shortcuts()
-        print("[INFO] スマートキャッシュ版 初期化完了")
+        print("[INFO] 高速応答版 初期化完了")
         
         if self.audio_thread:
             initial_volume_thread = self.settings.get('audio_volume', 100)
@@ -1781,14 +1838,19 @@ V1.0 Smart Cache Edition :
             current_frame = self.current_frame
             print(f"[DEBUG] モード切替: フレーム{current_frame}から再開")
             
-            self.full_stop()
-            self.is_playing = False
-            self.is_paused = False
-            
-            QApplication.processEvents()
-            time.sleep(0.2)
-            
-            self.start_processing_from_frame(current_frame)
+            self.fast_restart_playback(current_frame)
+
+    def fast_restart_playback(self, start_frame):
+        """高速な再生再開"""
+        print(f"[FAST-RESTART] フレーム{start_frame}から高速再開")
+        
+        # 軽量な停止（完全停止は行わない）
+        if self.process_thread and self.process_thread.isRunning():
+            self.process_thread._stop_flag = True
+            self.process_thread.wait(100)  # 短い待機時間
+        
+        # 即時再開
+        self.start_processing_from_frame(start_frame)
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -1873,34 +1935,63 @@ V1.0 Smart Cache Edition :
 
     def on_processing_finished(self):
         print("[INFO] AI処理が完了しました")
-        self.full_stop()
+        self.fast_stop()
         self.mode_label.setText("📊 モード: 完了")
 
     def seek_relative(self, delta):
+        """高速相対シーク"""
         if self.total_frames == 0 or not self.current_video:
             return
+        
         target_frame = max(0, min(self.current_frame + delta, self.total_frames - 1))
         
-        was_paused = self.is_paused
-        self.seek_to_frame(target_frame)
+        # 即時UI更新
+        self.current_frame = target_frame
+        self.progress_bar.setValue(target_frame)
+        self.video_widget.update_progress(target_frame)
         
-        if was_paused:
-             if self.process_thread:
-                 self.process_thread.pause()
-                 self.is_paused = True
-                 self.play_pause_btn.setText("▶ 再開")
-                 self.mode_label.setText("📊 モード: ⏸ 一時停止中")
-                 self.video_widget.set_progress_bar_color('red')
+        # キャッシュチェック
+        cached_frame = self.frame_cache.get(target_frame)
+        if cached_frame is not None:
+            self.video_widget.update_frame(cached_frame)
+            print(f"[FAST-SEEK] キャッシュヒット: フレーム{target_frame}")
+        
+        # 非同期シーク処理
+        self.fast_seek_to_frame(target_frame)
+
+    def fast_seek_to_frame(self, target_frame):
+        """高速シーク処理"""
+        if not self.current_video or self._seeking:
+            return
+        
+        self._seeking = True
+        
+        # 音声シーク（非ブロッキング）
+        if self.audio_thread:
+            target_sec = target_frame / self.video_fps if self.video_fps > 0 else 0
+            self.audio_thread.seek_to_time(target_sec)
+        
+        # スレッドが動作中の場合はシークリクエストを送信
+        if self.process_thread and self.process_thread.isRunning():
+            self.process_thread.request_seek(target_frame)
+            print(f"[FAST-SEEK] シークリクエスト送信: フレーム{target_frame}")
+        else:
+            # スレッドがなければ新規開始
+            self.start_processing_from_frame(target_frame)
+        
+        self._seeking = False
+
+    def seek_to_frame(self, target_frame):
+        """互換性のためのシーク処理"""
+        self.fast_seek_to_frame(target_frame)
 
     def closeEvent(self, event):
         print("=== 終了処理 ===")
-        self.full_stop()
+        self.fast_stop()
         
         if self.audio_thread:
             self.audio_thread.stop()
-            self.audio_thread.wait(5000)
-            if self.audio_thread.isRunning():
-                 self.audio_thread.terminate()
+            self.audio_thread.wait(1000)
         
         if hasattr(self, 'video_widget') and self.video_widget.texture_id:
             try:
@@ -1913,39 +2004,12 @@ V1.0 Smart Cache Edition :
         self.save_settings()
         event.accept()
 
-    def seek_to_frame(self, target_frame):
-        if not self.current_video or self._seeking or self.total_frames == 0:
-            return
-        
-        self._seeking = True
-        self.full_stop()
-        QApplication.processEvents()
-        time.sleep(0.1)
-        
-        self.current_frame = target_frame
-        self.progress_bar.setValue(target_frame)
-        self.video_widget.update_progress(target_frame)
-        
-        # キャッシュに再生位置を通知
-        self.frame_cache.update_playhead(target_frame)
-        
-        frame_data = self.frame_cache.get(target_frame)
-        if frame_data is not None:
-            self.video_widget.update_frame(frame_data)
-        
-        if self.audio_thread:
-            target_sec = target_frame / self.video_fps if self.video_fps > 0 else 0
-            self.audio_thread.seek_to_time(target_sec)
-        
-        self.start_processing_from_frame(target_frame)
-        self._seeking = False
-
     def seek_click(self, event):
         if self.total_frames > 0:
             pos = event.pos().x()
             width = self.progress_bar.width()
             target_frame = int((pos / width) * self.total_frames)
-            self.seek_to_frame(target_frame)
+            self.fast_seek_to_frame(target_frame)
 
     def open_video(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1983,7 +2047,7 @@ V1.0 Smart Cache Edition :
                 self.save_settings()
 
                 print("[INFO] 設定変更 - 完全リセット実行")
-                self.full_stop()
+                self.fast_stop()
                 
                 # チャンクサイズ変更時はキャッシュ再構築
                 if needs_cache_rebuild:
@@ -2030,7 +2094,7 @@ V1.0 Smart Cache Edition :
 
     def load_video(self, path):
         print(f"[INFO] 動画読み込み: {path}")
-        self.full_stop()
+        self.fast_stop()
         self.frame_cache.clear()
         self.video_widget.clear_frame()
         
@@ -2091,16 +2155,13 @@ V1.0 Smart Cache Edition :
         
         # 既存のスレッド/タイマーが残っていないか確認
         if hasattr(self, 'process_thread') and self.process_thread and self.process_thread.isRunning():
-            print("[WARNING] 既存のAIスレッドが動作中です。強制停止します。")
-            self.full_stop()
-            QApplication.processEvents()
-            time.sleep(0.1)
+            print("[WARNING] 既存のAIスレッドが動作中です。停止します。")
+            self.process_thread._stop_flag = True
+            self.process_thread.wait(100)
         
         if hasattr(self, 'original_timer') and self.original_timer and self.original_timer.isActive():
             print("[WARNING] 既存の原画タイマーが動作中です。停止します。")
             self.original_timer.stop()
-            QApplication.processEvents()
-            time.sleep(0.1)
         
         # AI処理無効時はOpenCVで直接再生
         if not self.ai_processing_enabled:
@@ -2246,6 +2307,7 @@ V1.0 Smart Cache Edition :
             print("[DEBUG] 原画再生終了")
 
     def toggle_playback(self):
+        """高速な再生/一時停止トグル"""
         if not self.ai_processing_enabled and hasattr(self, 'original_timer'):
             if self.is_paused:
                 self.original_timer.start()
@@ -2286,71 +2348,32 @@ V1.0 Smart Cache Edition :
             self.mode_label.setText("📊 モード: ⏸ 一時停止中")
             self.video_widget.set_progress_bar_color('red')
 
-    def full_stop(self):
-        """完全停止 - AI処理と原画処理の両方を確実に停止"""
-        print("[DEBUG] 完全停止実行")
+    def fast_stop(self):
+        """高速停止 - 最小限のクリーンアップのみ実行"""
+        print("[FAST-STOP] 高速停止実行")
         
-        # まず全ての再生を停止
+        # 状態フラグのみ設定
         self.is_playing = False
         self.is_paused = False
         
         # 原画処理の停止
         if hasattr(self, 'original_timer') and self.original_timer:
             self.original_timer.stop()
-            print("[DEBUG] 原画タイマー停止")
         
         if hasattr(self, 'original_capture') and self.original_capture:
             self.original_capture.release()
             self.original_capture = None
-            print("[DEBUG] 原画キャプチャ解放")
         
-        # AI処理スレッドの停止（存在する場合のみ）
+        # AI処理スレッドの停止（軽量）
         if hasattr(self, 'process_thread') and self.process_thread:
-            print("[DEBUG] AI処理スレッド停止中...")
-            # フラグ設定
             self.process_thread._stop_flag = True
-            self.process_thread.is_running = False
-            self.process_thread.is_paused = False
-            
-            # 優雅に停止を試みる
-            self.process_thread.stop()
-            
-            # 待機
-            if not self.process_thread.wait(2000):  # 2秒待機
-                print("[WARNING] AIスレッドが応答しないため強制終了")
-                self.process_thread.terminate()
-                self.process_thread.wait(1000)
-            
-            # 接続を切断
-            try:
-                if self.process_thread.frame_ready:
-                    self.process_thread.frame_ready.disconnect()
-                if self.process_thread.fps_updated:
-                    self.process_thread.fps_updated.disconnect()
-                if self.process_thread.progress_updated:
-                    self.process_thread.progress_updated.disconnect()
-                if self.process_thread.finished_signal:
-                    self.process_thread.finished_signal.disconnect()
-            except:
-                pass
-            
-            self.process_thread = None
-            print("[DEBUG] AI処理スレッド停止完了")
-        else:
-            print("[DEBUG] 停止するAIスレッドはありません")
-        
-        # 音声停止
-        if self.audio_thread:
-            self.audio_thread.stop_playback()
-            print("[DEBUG] 音声停止")
+            self.process_thread.wait(100)  # 短い待機時間
         
         # UI状態リセット
         self.play_pause_btn.setText("▶ 再生")
         self.play_pause_btn.setEnabled(self.current_video is not None)
         
-        QApplication.processEvents()
-        time.sleep(0.1)
-        print("[DEBUG] 完全停止完了")
+        print("[FAST-STOP] 高速停止完了")
 
 
 def main():
