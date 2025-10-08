@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-LADA REALTIME PLAYER V1.0 - Smart Cache Edition - 高速応答版
-
+LADA REALTIME PLAYER V1.0 - Smart Cache Edition - デッドロック修正版
 """
 
 import sys
@@ -118,7 +117,7 @@ class SettingsDialog(QDialog):
 
 
 class SmartChunkBasedCache:
-    """30FPS最適化スマートキャッシュ（パフォーマンス最適化版）"""
+    """30FPS最適化スマートキャッシュ（デッドロック対策版）"""
     
     def __init__(self, max_size_mb=12288, chunk_frames=150):
         self.chunk_frames = chunk_frames
@@ -128,7 +127,7 @@ class SmartChunkBasedCache:
         # チャンク管理
         self.chunks = {}  # chunk_id -> {'frames': dict, 'size_mb': float, 'last_access': float}
         self.access_order = deque()  # LRU順序
-        self.mutex = QMutex()
+        self.mutex = QMutex()  # 通常のミューテックス
         
         # 処理コスト追跡
         self.processing_costs = {}  # chunk_id -> cost_data
@@ -160,7 +159,7 @@ class SmartChunkBasedCache:
         # 再生状態
         self.current_playhead = 0
         
-        print(f"[SMART-CACHE] 初期化: {max_size_mb}MB, チャンク={chunk_frames}フレーム, 30FPS最適化")
+        print(f"[SMART-CACHE] 初期化: {max_size_mb}MB, チャンク={chunk_frames}フレーム, デッドロック対策版")
 
     def get_chunk_id(self, frame_num):
         """フレーム番号からチャンクIDを計算"""
@@ -176,27 +175,34 @@ class SmartChunkBasedCache:
         """フレーム処理時間を記録（最小オーバーヘッド）"""
         chunk_id = self.get_chunk_id(frame_num)
         
-        if chunk_id not in self.processing_costs:
-            self.processing_costs[chunk_id] = {
-                'frame_times': [],
-                'total_time': 0.0,
-                'sample_count': 0,
-                'last_sample_time': time.time()
-            }
-        
-        cost_data = self.processing_costs[chunk_id]
-        cost_data['frame_times'].append(processing_time)
-        cost_data['total_time'] += processing_time
-        cost_data['sample_count'] += 1
-        cost_data['last_sample_time'] = time.time()
-        
-        # 統計更新
-        self.performance_stats['total_frames'] += 1
-        self.performance_stats['total_processing_time'] += processing_time
-        
-        # 3サンプル以上でポリシー更新（高速判定）
-        if cost_data['sample_count'] == 3:
-            self._update_chunk_policy(chunk_id)
+        # ロック時間を最小限に
+        if not self.mutex.tryLock(10):  # 10msタイムアウト
+            return
+            
+        try:
+            if chunk_id not in self.processing_costs:
+                self.processing_costs[chunk_id] = {
+                    'frame_times': [],
+                    'total_time': 0.0,
+                    'sample_count': 0,
+                    'last_sample_time': time.time()
+                }
+            
+            cost_data = self.processing_costs[chunk_id]
+            cost_data['frame_times'].append(processing_time)
+            cost_data['total_time'] += processing_time
+            cost_data['sample_count'] += 1
+            cost_data['last_sample_time'] = time.time()
+            
+            # 統計更新
+            self.performance_stats['total_frames'] += 1
+            self.performance_stats['total_processing_time'] += processing_time
+            
+            # 3サンプル以上でポリシー更新（高速判定）
+            if cost_data['sample_count'] == 3:
+                self._update_chunk_policy(chunk_id)
+        finally:
+            self.mutex.unlock()
 
     def _update_chunk_policy(self, chunk_id):
         """高速なキャッシュポリシー決定"""
@@ -223,14 +229,6 @@ class SmartChunkBasedCache:
             'sample_size': cost_data['sample_count'],
             'last_updated': time.time()
         }
-        
-        # 制限付きデバッグ出力
-        current_time = time.time()
-        if (self.debug_enabled and 
-            current_time - self.last_debug_output > self.debug_interval and
-            avg_ms_per_frame > 50.0):  # 高負荷時のみ
-            print(f"[SMART-CACHE] 高負荷チャンク{chunk_id}: {policy} ({avg_ms_per_frame:.1f}ms)")
-            self.last_debug_output = current_time
 
     def _fast_temporal_smoothing(self, chunk_id, proposed_policy, proposed_priority):
         """高速な時空間平滑化"""
@@ -254,33 +252,6 @@ class SmartChunkBasedCache:
         
         return {'policy': proposed_policy, 'priority': proposed_priority}
 
-    def _trigger_prefetch(self, current_frame, processing_time):
-        """予測的先読みのトリガー"""
-        if processing_time > 0.05:  # 50ms以上の処理時間の場合
-            current_chunk = self.get_chunk_id(current_frame)
-            current_policy = self.cache_policies.get(current_chunk)
-            
-            if current_policy and current_policy['priority'] >= 2:  # 中負荷以上
-                # 1-3フレーム先を先読み（数を減らして高速化）
-                for ahead in range(1, 4):
-                    future_frame = current_frame + ahead
-                    if self.get(future_frame) is None and future_frame not in self.prefetch_queue:
-                        self.prefetch_queue.append(future_frame)
-                
-                # キューが溜まっていたら処理
-                if len(self.prefetch_queue) >= 3:
-                    self._process_prefetch_queue()
-
-    def _process_prefetch_queue(self):
-        """先読みキューを処理"""
-        if not self.prefetch_queue:
-            return
-            
-        # 最大2フレームまで先読み
-        for _ in range(min(2, len(self.prefetch_queue))):
-            frame_num = self.prefetch_queue.popleft()
-            # 非同期処理は実装せず、キュー管理のみ
-
     def should_cache_frame(self, frame_num, frame_data=None):
         """フレームをキャッシュすべきか判定"""
         chunk_id = self.get_chunk_id(frame_num)
@@ -297,8 +268,11 @@ class SmartChunkBasedCache:
         return policy['policy'] != 'no_cache'
 
     def get(self, frame_num):
-        """フレーム取得"""
-        with QMutexLocker(self.mutex):
+        """フレーム取得 - デッドロック対策"""
+        if not self.mutex.tryLock(10):  # 10msでタイムアウト
+            return None
+            
+        try:
             chunk_id = self.get_chunk_id(frame_num)
             
             if chunk_id in self.chunks:
@@ -315,10 +289,15 @@ class SmartChunkBasedCache:
             # キャッシュミス
             self.performance_stats['cache_misses'] += 1
             return None
+        finally:
+            self.mutex.unlock()
 
     def put(self, frame_num, frame):
-        """スマートキャッシュ判定付きのフレーム追加"""
-        with QMutexLocker(self.mutex):
+        """スマートキャッシュ判定付きのフレーム追加 - デッドロック対策"""
+        if not self.mutex.tryLock(10):  # 10msでタイムアウト
+            return
+            
+        try:
             if frame is None:
                 self._remove_frame(frame_num)
                 return
@@ -359,6 +338,8 @@ class SmartChunkBasedCache:
             # 容量超過時は非同期クリーンアップをスケジュール
             if self.current_size_mb > self.max_size_mb:
                 self._schedule_async_cleanup()
+        finally:
+            self.mutex.unlock()
 
     def _update_access_order(self, chunk_id):
         """LRU順序を更新"""
@@ -373,14 +354,18 @@ class SmartChunkBasedCache:
             self.cleanup_timer.start(50)  # 50ms後に実行
 
     def _async_cleanup(self):
-        """非同期でチャンク単位のクリーンアップを実行"""
+        """非同期でチャンク単位のクリーンアップを実行 - デッドロック対策"""
         if not self.pending_cleanup:
             return
             
         start_time = time.time()
         removed_count = 0
         
-        with QMutexLocker(self.mutex):
+        if not self.mutex.tryLock(50):  # 50msでタイムアウト
+            self.cleanup_timer.start(25)  # 再試行
+            return
+            
+        try:
             if self.current_size_mb <= self.max_size_mb * 0.8:
                 self.pending_cleanup = False
                 return
@@ -417,9 +402,8 @@ class SmartChunkBasedCache:
                 self.cleanup_timer.start(25)
             else:
                 self.pending_cleanup = False
-        
-        cleanup_time = (time.time() - start_time) * 1000
-        # デバッグ出力を削除（パフォーマンス向上のため）
+        finally:
+            self.mutex.unlock()
 
     def _get_chunk_cleanup_priority(self, chunk_id):
         """クリーンアップ時の優先度（低いほど先に削除）"""
@@ -487,22 +471,14 @@ class SmartChunkBasedCache:
     def update_playhead(self, frame_num):
         """再生位置を更新（保護対象の計算用）"""
         self.current_playhead = frame_num
-        
-        # 再生位置に基づく追加の先読み（頻度を減らして高速化）
-        if self.prefetch_enabled and frame_num % 10 == 0:  # 10フレームに1回のみ
-            current_chunk = self.get_chunk_id(frame_num)
-            for ahead_chunk in [current_chunk + 1]:  # 次のチャンクのみ
-                if ahead_chunk not in self.cache_policies:
-                    # 未調査のチャンクを先読み対象に追加
-                    start_frame = ahead_chunk * self.chunk_frames
-                    for i in range(min(2, self.chunk_frames)):  # 2フレームのみ
-                        future_frame = start_frame + i
-                        if future_frame not in self.prefetch_queue:
-                            self.prefetch_queue.append(future_frame)
 
     def clear(self):
-        """キャッシュ全クリア"""
-        with QMutexLocker(self.mutex):
+        """キャッシュ全クリア - デッドロック対策"""
+        if not self.mutex.tryLock(100):  # 100msでタイムアウト
+            print("[WARNING] キャッシュクリア: ミューテックスの取得に失敗")
+            return
+            
+        try:
             self.chunks.clear()
             self.access_order.clear()
             self.current_size_mb = 0
@@ -519,10 +495,24 @@ class SmartChunkBasedCache:
                 'total_frames': 0,
                 'total_processing_time': 0.0
             }
+        finally:
+            self.mutex.unlock()
 
     def get_stats(self):
-        """キャッシュ統計を取得"""
-        with QMutexLocker(self.mutex):
+        """キャッシュ統計を取得 - デッドロック対策"""
+        if not self.mutex.tryLock(10):
+            return {
+                'chunk_count': 0,
+                'total_frames': 0,
+                'size_mb': 0,
+                'max_mb': self.max_size_mb,
+                'chunk_frames': self.chunk_frames,
+                'hit_ratio': 0.0,
+                'avg_processing_time': 0.0,
+                'policy_distribution': {}
+            }
+            
+        try:
             chunk_count = len(self.chunks)
             total_frames = sum(len(chunk['frames']) for chunk in self.chunks.values())
             
@@ -552,11 +542,8 @@ class SmartChunkBasedCache:
                 stats['policy_distribution'][policy_name] = stats['policy_distribution'].get(policy_name, 0) + 1
             
             return stats
-
-    def enable_debug(self, enabled=True):
-        """デバッグ出力の有効/無効を設定"""
-        self.debug_enabled = enabled
-        print(f"[SMART-CACHE] デバッグ出力: {'有効' if enabled else '無効'}")
+        finally:
+            self.mutex.unlock()
 
 
 class VideoGLWidget(QOpenGLWidget):
@@ -1049,8 +1036,7 @@ class ProcessThread(QThread):
         self.is_running = False
         self._stop_flag = False
         self.is_paused = False
-        self.pause_mutex = QMutex()
-        self.pause_condition = QMutex()
+        self.pause_mutex = QMutex()  # 通常のミューテックス
         
         self.audio_thread = audio_thread
         self.video_fps = video_fps
@@ -1059,56 +1045,98 @@ class ProcessThread(QThread):
         # 高速シーク用の変数
         self._seek_requested = False
         self._seek_target = 0
-        self._seek_mutex = QMutex()
+        self._seek_mutex = QMutex()  # 通常のミューテックス
         
-        # パフォーマンス計測
-        self.last_frame_time = time.time()
-        self.frame_times = deque(maxlen=30)
-    
+        # デッドロック防止用
+        self._safe_stop = False
+        
+        print(f"[THREAD-{thread_id}] プロセススレッド初期化完了")
+
     def request_seek(self, target_frame):
-        """高速シークリクエスト"""
-        with QMutexLocker(self._seek_mutex):
+        """高速シークリクエスト - デッドロック対策"""
+        if not self._seek_mutex.tryLock(10):
+            print(f"[THREAD-{self.thread_id}] シークリクエスト: ミューテックス取得失敗")
+            return False
+            
+        try:
             self._seek_requested = True
             self._seek_target = target_frame
-            print(f"[FAST-SEEK] シークリクエスト: フレーム{target_frame}")
-    
+            print(f"[THREAD-{self.thread_id}] シークリクエスト受信: フレーム{target_frame}")
+            return True
+        finally:
+            self._seek_mutex.unlock()
+
     def pause(self):
-        """高速一時停止"""
-        with QMutexLocker(self.pause_mutex):
+        """高速一時停止 - デッドロック対策"""
+        if not self.pause_mutex.tryLock(10):
+            print(f"[THREAD-{self.thread_id}] 一時停止: ミューテックス取得失敗")
+            return
+            
+        try:
             self.is_paused = True
             if self.audio_thread:
                 self.audio_thread.pause_audio()
-        print("[FAST-PAUSE] 一時停止完了")
-    
+            print(f"[THREAD-{self.thread_id}] 一時停止完了")
+        finally:
+            self.pause_mutex.unlock()
+
     def resume(self):
-        """高速再開"""
-        with QMutexLocker(self.pause_mutex):
+        """高速再開 - デッドロック対策"""
+        if not self.pause_mutex.tryLock(10):
+            print(f"[THREAD-{self.thread_id}] 再開: ミューテックス取得失敗")
+            return
+            
+        try:
             self.is_paused = False
             if self.audio_thread:
                 start_sec = self.start_frame / self.video_fps if self.video_fps > 0 else 0
                 self.audio_thread.resume_audio(start_sec)
-        print("[FAST-RESUME] 再開完了")
-    
+            print(f"[THREAD-{self.thread_id}] 再開完了")
+        finally:
+            self.pause_mutex.unlock()
+
+    def safe_stop(self):
+        """安全な停止 - デッドロック対策"""
+        print(f"[THREAD-{self.thread_id}] 安全停止開始")
+        self._safe_stop = True
+        self._stop_flag = True
+        self.is_running = False
+        self.is_paused = False
+        
+        # フレームレストーラーの停止（例外を無視）
+        if self.frame_restorer:
+            try:
+                self.frame_restorer.stop()
+            except Exception as e:
+                print(f"[THREAD-{self.thread_id}] フレームレストーラー停止中の例外: {e}")
+        
+        # スレッド終了待機（タイムアウト付き）
+        if not self.wait(1000):  # 1秒待機
+            print(f"[THREAD-{self.thread_id}] スレッド終了待機タイムアウト、強制終了")
+            self.terminate()
+            self.wait(500)
+        
+        print(f"[THREAD-{self.thread_id}] 安全停止完了")
+
     def run(self):
-        print(f"[DEBUG] スレッド{self.thread_id}開始:")
-        print(f"  batch_size={self.batch_size}")
-        print(f"  queue_size_mb={self.queue_size_mb}")
-        print(f"  max_clip_length={self.max_clip_length}")
+        print(f"[THREAD-{self.thread_id}] スレッド開始")
         
         self.is_running = True
         self._stop_flag = False
+        self._safe_stop = False
         
         try:
             if not LADA_AVAILABLE:
+                print(f"[THREAD-{self.thread_id}] LADA利用不可")
                 return
             
             video_meta = video_utils.get_video_meta_data(self.video_path)
             self.total_frames = video_meta.frames_count
             self.video_fps = video_meta.video_fps
             
-            print(f"[DEBUG] 動画情報: {self.total_frames}フレーム, {self.video_fps}FPS")
+            print(f"[THREAD-{self.thread_id}] 動画情報: {self.total_frames}フレーム, {self.video_fps}FPS")
             
-            if self._stop_flag:
+            if self._stop_flag or self._safe_stop:
                 return
             
             detection_model, restoration_model, pad_mode = load_models(
@@ -1119,7 +1147,7 @@ class ProcessThread(QThread):
                 mosaic_detection_model_path=str(self.detection_path)
             )
             
-            if self._stop_flag:
+            if self._stop_flag or self._safe_stop:
                 return
             
             self.frame_restorer = OptimizedFrameRestorer(
@@ -1155,7 +1183,7 @@ class ProcessThread(QThread):
             # キャッシュに再生位置を通知
             self.frame_cache.update_playhead(frame_count)
             
-            if self.audio_thread:
+            if self.audio_thread and not self._safe_stop:
                 start_sec = self.start_frame / self.video_fps if self.video_fps > 0 else 0
                 self.audio_thread.start_playback(str(self.video_path), start_sec)
                 
@@ -1165,42 +1193,54 @@ class ProcessThread(QThread):
             consecutive_cached_frames = 0
             max_consecutive_cached = 30
             
-            while self.is_running and not self._stop_flag and frame_count < self.total_frames:
+            while self.is_running and not self._stop_flag and not self._safe_stop and frame_count < self.total_frames:
+                # 安全停止チェック
+                if self._safe_stop:
+                    break
+                    
                 # シークリクエストチェック（高速）
-                with QMutexLocker(self._seek_mutex):
-                    if self._seek_requested:
-                        frame_count = self._seek_target
-                        self.start_frame = frame_count
-                        start_ns = int((frame_count / self.video_fps) * 1_000_000_000)
-                        
-                        # フレームレストーラーを再起動
-                        try:
-                            self.frame_restorer.stop()
-                        except:
-                            pass
-                        
-                        self.frame_restorer.start(start_ns=start_ns)
-                        frame_restorer_iter = iter(self.frame_restorer)
-                        pending_ai_frame = None
-                        
-                        # 状態リセット
-                        start_time = time.time()
-                        total_pause_duration = 0
-                        frame_count_at_reset = frame_count
-                        last_mode_was_cached = False
-                        paused_cache_count = 0
-                        pause_start_time = 0
-                        
-                        # キャッシュに再生位置を通知
-                        self.frame_cache.update_playhead(frame_count)
-                        
-                        # 音声シーク
-                        if self.audio_thread:
-                            target_sec = frame_count / self.video_fps
-                            self.audio_thread.seek_to_time(target_sec)
-                        
-                        self._seek_requested = False
-                        print(f"[FAST-SEEK] シーク完了: フレーム{frame_count}")
+                seek_processed = False
+                if self._seek_mutex.tryLock(1):  # 1msでタイムアウト
+                    try:
+                        if self._seek_requested:
+                            frame_count = self._seek_target
+                            self.start_frame = frame_count
+                            start_ns = int((frame_count / self.video_fps) * 1_000_000_000)
+                            
+                            # フレームレストーラーを再起動
+                            try:
+                                self.frame_restorer.stop()
+                            except:
+                                pass
+                            
+                            self.frame_restorer.start(start_ns=start_ns)
+                            frame_restorer_iter = iter(self.frame_restorer)
+                            pending_ai_frame = None
+                            
+                            # 状態リセット
+                            start_time = time.time()
+                            total_pause_duration = 0
+                            frame_count_at_reset = frame_count
+                            last_mode_was_cached = False
+                            paused_cache_count = 0
+                            pause_start_time = 0
+                            
+                            # キャッシュに再生位置を通知
+                            self.frame_cache.update_playhead(frame_count)
+                            
+                            # 音声シーク
+                            if self.audio_thread and not self._safe_stop:
+                                target_sec = frame_count / self.video_fps
+                                self.audio_thread.seek_to_time(target_sec)
+                            
+                            self._seek_requested = False
+                            seek_processed = True
+                            print(f"[THREAD-{self.thread_id}] シーク完了: フレーム{frame_count}")
+                    finally:
+                        self._seek_mutex.unlock()
+                
+                if seek_processed:
+                    continue
                 
                 # フレーム処理開始時間
                 frame_start_time = time.time()
@@ -1209,11 +1249,20 @@ class ProcessThread(QThread):
                 if frame_count % 30 == 0:
                     self.frame_cache.update_playhead(frame_count)
                 
-                if self.is_paused and not self._stop_flag:
+                # 一時停止チェック
+                pause_check_start = time.time()
+                is_paused_check = False
+                if self.pause_mutex.tryLock(1):  # 1msでタイムアウト
+                    try:
+                        is_paused_check = self.is_paused
+                    finally:
+                        self.pause_mutex.unlock()
+                
+                if is_paused_check and not self._stop_flag and not self._safe_stop:
                     if pause_start_time == 0:
                         pause_start_time = time.time()
                         paused_cache_count = 0
-                        print(f"[DEBUG] 一時停止開始 - バックグラウンドキャッシュ蓄積中(目標:{cache_frames_during_pause}フレーム)")
+                        print(f"[THREAD-{self.thread_id}] 一時停止開始")
                     
                     if paused_cache_count < cache_frames_during_pause:
                         if self.frame_cache.get(frame_count + paused_cache_count) is None:
@@ -1223,17 +1272,9 @@ class ProcessThread(QThread):
                                     restored_frame, _ = item
                                     self.frame_cache.put(frame_count + paused_cache_count, restored_frame)
                                     paused_cache_count += 1
-                                    
-                                    if paused_cache_count % 30 == 0:
-                                        print(f"[DEBUG] 一時停止中キャッシュ: {paused_cache_count}/{cache_frames_during_pause}フレーム蓄積")
                             except StopIteration:
-                                print(f"[DEBUG] 一時停止中キャッシュ完了: {paused_cache_count}フレーム蓄積済み")
                                 break
                         else:
-                            paused_cache_count += 1
-                    else:
-                        if paused_cache_count == cache_frames_during_pause:
-                            print(f"[DEBUG] 一時停止中キャッシュ完了: {cache_frames_during_pause}フレーム蓄積済み - 待機モード")
                             paused_cache_count += 1
                     
                     time.sleep(0.01)
@@ -1242,11 +1283,10 @@ class ProcessThread(QThread):
                 if pause_start_time > 0:
                     pause_duration = time.time() - pause_start_time
                     total_pause_duration += pause_duration
-                    print(f"[DEBUG] 一時停止解除 - 停止時間: {pause_duration:.1f}秒, キャッシュ活用モードで再開")
                     pause_start_time = 0
                     paused_cache_count = 0
                 
-                if self._stop_flag:
+                if self._stop_flag or self._safe_stop:
                     break
                 
                 cached_frame = self.frame_cache.get(frame_count)
@@ -1255,7 +1295,7 @@ class ProcessThread(QThread):
                     final_frame = cached_frame
                     is_cached = True
                     consecutive_cached_frames += 1
-                    processing_time = 0.0  # キャッシュヒットは処理時間0
+                    processing_time = 0.0
                     
                     if consecutive_cached_frames > max_consecutive_cached:
                         self.frame_cache.put(frame_count, None)
@@ -1266,7 +1306,6 @@ class ProcessThread(QThread):
                         start_time = time.time()
                         total_pause_duration = 0
                         frame_count_at_reset = frame_count
-                        print("[DEBUG] キャッシュモード開始 - スムーズ再生")
                     
                 else:
                     consecutive_cached_frames = 0
@@ -1275,7 +1314,6 @@ class ProcessThread(QThread):
                         start_time = time.time()
                         total_pause_duration = 0
                         frame_count_at_reset = frame_count
-                        print("[DEBUG] AI処理モード切替")
                     
                     if pending_ai_frame is not None:
                         restored_frame, frame_pts = pending_ai_frame
@@ -1319,7 +1357,6 @@ class ProcessThread(QThread):
                 wait_time = target_time - elapsed
                 
                 if wait_time < -0.5:
-                    print(f"[WARNING] フレーム遅延検出: {wait_time:.3f}s, スキップ調整")
                     start_time = time.time() - (frames_since_reset * frame_interval)
                     total_pause_duration = 0
                     wait_time = 0
@@ -1327,54 +1364,44 @@ class ProcessThread(QThread):
                 if wait_time > 0:
                     time.sleep(min(wait_time, 0.1))
                 
-                self.frame_ready.emit(final_frame, frame_count, is_cached)
+                # フレーム準備シグナル発行（デッドロック防止）
+                if not self._safe_stop:
+                    self.frame_ready.emit(final_frame, frame_count, is_cached)
                 
-                if self.audio_thread and frame_count % (int(self.video_fps) * 10) == 0:
+                if self.audio_thread and frame_count % (int(self.video_fps) * 10) == 0 and not self._safe_stop:
                     current_sec = frame_count / self.video_fps
                     self.audio_thread.seek_to_time(current_sec)
                 
                 frame_count += 1
-                self.progress_updated.emit(frame_count, self.total_frames)
+                if not self._safe_stop:
+                    self.progress_updated.emit(frame_count, self.total_frames)
                 
                 if frame_count % 15 == 0:
                     elapsed = time.time() - start_time - total_pause_duration
                     actual_fps = (frame_count - self.start_frame) / elapsed if elapsed > 0 else 0
-                    self.fps_updated.emit(actual_fps)
-                    
-                    cache_status = "キャッシュ" if is_cached else "AI処理"
-                    
-                    # FPSが低い場合のみ詳細出力
-                    if actual_fps < 25.0 or not is_cached:
-                        print(f"[DEBUG] FPS: {actual_fps:.1f}, モード: {cache_status}")
-                        if not is_cached and lada_time > 0:
-                            print(f"[DEBUG] LADA処理時間: {lada_time:.3f}秒/15フレーム")
+                    if not self._safe_stop:
+                        self.fps_updated.emit(actual_fps)
             
-            if not self._stop_flag:
+            if not self._stop_flag and not self._safe_stop:
                 self.finished_signal.emit()
             
         except Exception as e:
-            print(f"AI処理エラー (thread {self.thread_id}): {e}")
+            print(f"[THREAD-{self.thread_id}] AI処理エラー: {e}")
             import traceback
             traceback.print_exc()
         finally:
-            if self.frame_restorer:
+            print(f"[THREAD-{self.thread_id}] スレッド終了処理開始")
+            # フレームレストーラーの安全な停止
+            if self.frame_restorer and not self._safe_stop:
                 try:
                     self.frame_restorer.stop()
-                except:
-                    pass
+                except Exception as e:
+                    print(f"[THREAD-{self.thread_id}] フレームレストーラー停止中の例外: {e}")
+            
             self.is_running = False
-            if self.audio_thread:
+            if self.audio_thread and not self._safe_stop:
                 self.audio_thread.stop_playback()
-    
-    def stop(self):
-        self._stop_flag = True
-        self.is_running = False
-        self.resume()
-        if self.frame_restorer:
-            try:
-                self.frame_restorer.stop()
-            except:
-                pass
+            print(f"[THREAD-{self.thread_id}] スレッド終了処理完了")
 
 
 class AudioThread(QThread):
@@ -1391,7 +1418,7 @@ class AudioThread(QThread):
         self.player.audio_set_volume(self.volume)
         self._update_vlc_mute_state()
         
-        print(f"[DEBUG] AudioThread初期化: Volume={self.volume}, Mute={self.user_muted}")
+        print(f"[AUDIO] AudioThread初期化: Volume={self.volume}, Mute={self.user_muted}")
 
     def run(self):
         while not self._stop_flag:
@@ -1408,98 +1435,109 @@ class AudioThread(QThread):
             return
         self.internal_muted = is_muted
         self._update_vlc_mute_state()
-        print(f"[DEBUG] 内部ミュート設定: {is_muted}")
-        
+
     def start_playback(self, video_path, start_sec=0.0):
-        if not VLC_AVAILABLE:
+        if not VLC_AVAILABLE or self._stop_flag:
             return
             
-        media = self.vlc_instance.media_new(video_path)
-        self.player.set_media(media)
-        
-        msec = int(start_sec * 1000)
-        
-        print(f"[DEBUG] 音声再生開始: {video_path} から {start_sec:.2f}秒")
-        
-        self.set_internal_mute(True)
-        self.player.play()
-        time.sleep(0.01)
-        
-        if start_sec > 0.0:
-            for _ in range(10):
-                if self.player.get_state() in (vlc.State.Playing, vlc.State.Paused):
-                    break
-                time.sleep(0.05)
+        try:
+            media = self.vlc_instance.media_new(video_path)
+            self.player.set_media(media)
             
-            if self.player.is_seekable():
-                self.player.set_time(msec)
-                print(f"[DEBUG] 音声シーク(初期): {msec}ms")
+            msec = int(start_sec * 1000)
+            
+            self.set_internal_mute(True)
+            self.player.play()
+            time.sleep(0.01)
+            
+            if start_sec > 0.0:
+                for _ in range(10):
+                    if self.player.get_state() in (vlc.State.Playing, vlc.State.Paused):
+                        break
+                    time.sleep(0.05)
+                
+                if self.player.is_seekable():
+                    self.player.set_time(msec)
 
-        self.set_internal_mute(False)
-        self._is_paused = False
+            self.set_internal_mute(False)
+            self._is_paused = False
+        except Exception as e:
+            print(f"[AUDIO] 再生開始エラー: {e}")
         
     def stop_playback(self):
         if not VLC_AVAILABLE:
             return
             
-        print("[DEBUG] 音声再生停止")
-        self.player.stop()
-        self._is_paused = True
+        try:
+            self.player.stop()
+            self._is_paused = True
+        except Exception as e:
+            print(f"[AUDIO] 再生停止エラー: {e}")
 
     def pause_audio(self):
-        if not VLC_AVAILABLE or self._is_paused:
+        if not VLC_AVAILABLE or self._is_paused or self._stop_flag:
             return
             
-        print("[DEBUG] 音声一時停止")
-        self.player.pause()
-        self._is_paused = True
-    
+        try:
+            self.player.pause()
+            self._is_paused = True
+        except Exception as e:
+            print(f"[AUDIO] 一時停止エラー: {e}")
+
     def resume_audio(self, start_sec):
-        if not VLC_AVAILABLE or not self._is_paused:
+        if not VLC_AVAILABLE or not self._is_paused or self._stop_flag:
             return
             
-        print(f"[DEBUG] 音声再生再開: {start_sec:.2f}秒へシーク")
-        self.seek_to_time(start_sec)
-        self.player.play()
-        self._is_paused = False
-        self._update_vlc_mute_state()
+        try:
+            self.seek_to_time(start_sec)
+            self.player.play()
+            self._is_paused = False
+            self._update_vlc_mute_state()
+        except Exception as e:
+            print(f"[AUDIO] 再生再開エラー: {e}")
 
     def seek_to_time(self, seconds):
-        if not VLC_AVAILABLE:
+        if not VLC_AVAILABLE or self._stop_flag:
             return
             
-        msec = int(seconds * 1000)
-        
-        self.set_internal_mute(True)
-        
-        for _ in range(10):
-            if self.player.get_state() in (vlc.State.Playing, vlc.State.Paused):
-                break
-            time.sleep(0.1)
+        try:
+            msec = int(seconds * 1000)
+            
+            self.set_internal_mute(True)
+            
+            for _ in range(10):
+                if self.player.get_state() in (vlc.State.Playing, vlc.State.Paused):
+                    break
+                time.sleep(0.1)
 
-        if self.player.is_seekable():
-            self.player.set_time(msec)
-            print(f"[DEBUG] 音声シーク: {msec}ms")
-        
-        self.set_internal_mute(False)
+            if self.player.is_seekable():
+                self.player.set_time(msec)
+            
+            self.set_internal_mute(False)
+        except Exception as e:
+            print(f"[AUDIO] シークエラー: {e}")
 
     def set_volume(self, volume):
         if not VLC_AVAILABLE:
             return
         self.volume = max(0, min(100, volume))
         self.player.audio_set_volume(self.volume)
-        print(f"[DEBUG] 音量設定: {self.volume}")
 
     def toggle_mute(self, is_muted):
         if not VLC_AVAILABLE:
             return
         self.user_muted = is_muted
         self._update_vlc_mute_state()
-        print(f"[DEBUG] ユーザーミュート設定: {is_muted}")
 
-    def stop(self):
+    def safe_stop(self):
+        """安全な停止"""
+        print("[AUDIO] 安全停止開始")
         self._stop_flag = True
         self.stop_playback()
+        if not self.wait(1000):  # 1秒待機
+            self.terminate()
+            self.wait(500)
+        print("[AUDIO] 安全停止完了")
 
 
 class LadaFinalPlayer(QMainWindow):
@@ -1550,13 +1588,14 @@ class LadaFinalPlayer(QMainWindow):
         self.stats_timer.start(1000)
         
         self.init_ui()
+        print("[MAIN] プレイヤー初期化完了 - デッドロック対策版")
 
     def load_settings(self):
         if CONFIG_FILE.exists():
             try:
                 with open(CONFIG_FILE, 'r') as f:
                     settings = json.load(f)
-                    print(f"[INFO] 設定読み込み: 音量={settings.get('audio_volume')}, ミュート={settings.get('audio_muted')}")
+                    print(f"[MAIN] 設定読み込み: 音量={settings.get('audio_volume')}, ミュート={settings.get('audio_muted')}")
                     return settings
             except:
                 pass
@@ -1580,12 +1619,11 @@ class LadaFinalPlayer(QMainWindow):
         try:
             with open(CONFIG_FILE, 'w') as f:
                 json.dump(self.settings, f, indent=2)
-            print(f"[INFO] 設定保存: 音量={self.settings.get('audio_volume')}, ミュート={self.settings.get('audio_muted')}")
         except Exception as e:
-            print(f"[ERROR] 設定保存失敗: {e}")
+            print(f"[MAIN] 設定保存失敗: {e}")
 
     def init_ui(self):
-        self.setWindowTitle("LADA REALTIME PLAYER V1.0 - Smart Cache - 高速応答版")
+        self.setWindowTitle("LADA REALTIME PLAYER V1.0 - Smart Cache - デッドロック対策版")
         self.setGeometry(100, 100, 1200, 850)
         
         central = QWidget()
@@ -1710,14 +1748,13 @@ class LadaFinalPlayer(QMainWindow):
         info.setReadOnly(True)
         info.setMaximumHeight(100)
         info.setText("""
-V1.0 Smart Cache Edition - 高速応答版 : 
+V1.0 Smart Cache Edition - デッドロック対策版 : 
 操作: F=フルスクリーントグル | Space=再生/停止 | M=ミュートトグル | X=AI処理トグル | 進捗バークリックでシーク
-高速シーク: キャッシュ優先、スレッド再利用による瞬時応答
+デッドロック対策: タイムアウト付きミューテックス、安全なスレッド停止
 """)
         layout.addWidget(info)
         
         self.setup_shortcuts()
-        print("[INFO] 高速応答版 初期化完了")
         
         if self.audio_thread:
             initial_volume_thread = self.settings.get('audio_volume', 100)
@@ -1759,8 +1796,6 @@ V1.0 Smart Cache Edition - 高速応答版 :
         
         self.shortcut_ai_toggle = QShortcut(QKeySequence('X'), self)
         self.shortcut_ai_toggle.activated.connect(self.toggle_ai_processing)
-        
-        print("[INFO] ショートカット設定完了")
 
     def toggle_mute_shortcut(self):
         if self.audio_thread:
@@ -1772,7 +1807,6 @@ V1.0 Smart Cache Edition - 高速応答版 :
             if new_mute_state:
                 self.settings['last_volume'] = self.audio_thread.volume
                 self.volume_slider.setValue(0)
-                print(f"[DEBUG] ミュートON: 音量{self.settings['last_volume']}を保存")
             else:
                 unmuted_volume = self.settings.get('last_volume', self.settings.get('audio_volume', 100))
                 if isinstance(unmuted_volume, float):
@@ -1781,10 +1815,8 @@ V1.0 Smart Cache Edition - 高速応答版 :
                 
                 self.volume_slider.setValue(unmuted_volume)
                 self.audio_thread.set_volume(unmuted_volume)
-                print(f"[DEBUG] ミュートOFF: 音量{unmuted_volume}に復元")
             
             self.save_audio_settings()
-            print(f"[DEBUG] ミュートトグル: {'ON' if new_mute_state else 'OFF'}")
 
     def toggle_user_mute(self, checked):
         if self.audio_thread:
@@ -1794,7 +1826,6 @@ V1.0 Smart Cache Edition - 高速応答版 :
             if checked:
                 self.settings['last_volume'] = self.audio_thread.volume
                 self.volume_slider.setValue(0)
-                print(f"[DEBUG] ミュートON(ボタン): 音量{self.settings['last_volume']}を保存")
             else:
                 unmuted_volume = self.settings.get('last_volume', self.settings.get('audio_volume', 100))
                 if isinstance(unmuted_volume, float):
@@ -1803,7 +1834,6 @@ V1.0 Smart Cache Edition - 高速応答版 :
                 
                 self.volume_slider.setValue(unmuted_volume)
                 self.audio_thread.set_volume(unmuted_volume)
-                print(f"[DEBUG] ミュートOFF(ボタン): 音量{unmuted_volume}に復元")
             
             self.save_audio_settings()
 
@@ -1815,7 +1845,6 @@ V1.0 Smart Cache Edition - 高速応答版 :
                 self.audio_thread.toggle_mute(False)
                 self.mute_btn.setChecked(False)
                 self.mute_btn.setText("🔊")
-                print(f"[DEBUG] スライダー操作でミュート解除: 音量{value}")
             
             self.settings['audio_volume'] = value
             self.save_audio_settings()
@@ -1827,27 +1856,21 @@ V1.0 Smart Cache Edition - 高速応答版 :
             self.ai_toggle_btn.setText("🤖 AI: ON")
             self.ai_toggle_btn.setChecked(True)
             self.mode_label.setText("📊 モード: 🔄 AI処理有効")
-            print("[DEBUG] AI処理: 有効")
         else:
             self.ai_toggle_btn.setText("🎥 原画: ON")
             self.ai_toggle_btn.setChecked(False)
             self.mode_label.setText("📊 モード: 🎥 原画再生")
-            print("[DEBUG] AI処理: 無効 (原画再生)")
         
         if self.current_video:
             current_frame = self.current_frame
-            print(f"[DEBUG] モード切替: フレーム{current_frame}から再開")
-            
-            self.fast_restart_playback(current_frame)
+            self.safe_restart_playback(current_frame)
 
-    def fast_restart_playback(self, start_frame):
-        """高速な再生再開"""
-        print(f"[FAST-RESTART] フレーム{start_frame}から高速再開")
+    def safe_restart_playback(self, start_frame):
+        """安全な再生再開"""
+        print(f"[MAIN] 安全な再生再開: フレーム{start_frame}")
         
-        # 軽量な停止（完全停止は行わない）
-        if self.process_thread and self.process_thread.isRunning():
-            self.process_thread._stop_flag = True
-            self.process_thread.wait(100)  # 短い待機時間
+        # 安全な停止
+        self.safe_stop()
         
         # 即時再開
         self.start_processing_from_frame(start_frame)
@@ -1871,7 +1894,6 @@ V1.0 Smart Cache Edition - 高速応答版 :
         if urls:
             file_path = urls[0].toLocalFile()
             if self.is_video_file(file_path):
-                print(f"[DEBUG] メインウィンドウD&D: {file_path}")
                 self.load_video(file_path)
                 event.acceptProposedAction()
 
@@ -1884,16 +1906,15 @@ V1.0 Smart Cache Edition - 高速応答版 :
         stats = self.frame_cache.get_stats()
         self.cache_label.setText(f"💾 キャッシュ: {stats['size_mb']:.1f}MB ({stats['total_frames']}f)")
         
-        # スマートキャッシュ統計（1秒に1回だけ更新）
+        # スマートキャッシュ統計
         if 'hit_ratio' in stats and 'policy_distribution' in stats:
             hit_ratio = stats['hit_ratio'] * 100
             
-            # ポリシー分布を簡潔に表示
             policy_summary = ""
             total_chunks = sum(stats['policy_distribution'].values())
             for policy, count in stats['policy_distribution'].items():
                 percentage = (count / total_chunks) * 100 if total_chunks > 0 else 0
-                if percentage >= 5.0:  # 5%以上のポリシーのみ表示
+                if percentage >= 5.0:
                     policy_summary += f"{policy[:2]}:{percentage:.0f}% "
             
             self.smart_cache_label.setText(f"🤖 Hit:{hit_ratio:.0f}% {policy_summary.strip()}")
@@ -1934,8 +1955,8 @@ V1.0 Smart Cache Edition - 高速応答版 :
         self.video_widget.update_progress(current)
 
     def on_processing_finished(self):
-        print("[INFO] AI処理が完了しました")
-        self.fast_stop()
+        print("[MAIN] AI処理が完了しました")
+        self.safe_stop()
         self.mode_label.setText("📊 モード: 完了")
 
     def seek_relative(self, delta):
@@ -1954,7 +1975,6 @@ V1.0 Smart Cache Edition - 高速応答版 :
         cached_frame = self.frame_cache.get(target_frame)
         if cached_frame is not None:
             self.video_widget.update_frame(cached_frame)
-            print(f"[FAST-SEEK] キャッシュヒット: フレーム{target_frame}")
         
         # 非同期シーク処理
         self.fast_seek_to_frame(target_frame)
@@ -1973,8 +1993,9 @@ V1.0 Smart Cache Edition - 高速応答版 :
         
         # スレッドが動作中の場合はシークリクエストを送信
         if self.process_thread and self.process_thread.isRunning():
-            self.process_thread.request_seek(target_frame)
-            print(f"[FAST-SEEK] シークリクエスト送信: フレーム{target_frame}")
+            success = self.process_thread.request_seek(target_frame)
+            if not success:
+                print("[MAIN] シークリクエスト送信失敗")
         else:
             # スレッドがなければ新規開始
             self.start_processing_from_frame(target_frame)
@@ -1986,13 +2007,14 @@ V1.0 Smart Cache Edition - 高速応答版 :
         self.fast_seek_to_frame(target_frame)
 
     def closeEvent(self, event):
-        print("=== 終了処理 ===")
-        self.fast_stop()
+        print("=== 安全な終了処理 ===")
+        self.safe_stop()
         
+        # 音声スレッドの安全な停止
         if self.audio_thread:
-            self.audio_thread.stop()
-            self.audio_thread.wait(1000)
+            self.audio_thread.safe_stop()
         
+        # OpenGLリソース解放
         if hasattr(self, 'video_widget') and self.video_widget.texture_id:
             try:
                 self.video_widget.makeCurrent()
@@ -2002,6 +2024,7 @@ V1.0 Smart Cache Edition - 高速応答版 :
         
         self.frame_cache.clear()
         self.save_settings()
+        print("=== 終了処理完了 ===")
         event.accept()
 
     def seek_click(self, event):
@@ -2024,11 +2047,9 @@ V1.0 Smart Cache Edition - 高速応答版 :
         if dialog.exec() == QDialog.DialogCode.Accepted:
             new_settings = dialog.get_settings()
             
-            # 変更検出フラグ
             needs_restart = False
             needs_cache_rebuild = False
             
-            # キャッシュ構造に影響する設定変更を検出
             cache_related_settings = [
                 'batch_size', 'queue_size_mb', 'max_clip_length',
                 'cache_size_mb', 'chunk_frames'
@@ -2039,25 +2060,21 @@ V1.0 Smart Cache Edition - 高速応答版 :
                     needs_restart = True
                     if key == 'chunk_frames':
                         needs_cache_rebuild = True
-                        print(f"[INFO] チャンクサイズ変更: {self.settings.get(key)} → {new_settings.get(key)}")
                     break
             
             if needs_restart:
                 self.settings.update(new_settings)
                 self.save_settings()
 
-                print("[INFO] 設定変更 - 完全リセット実行")
-                self.fast_stop()
+                print("[MAIN] 設定変更 - 安全なリセット実行")
+                self.safe_stop()
                 
-                # チャンクサイズ変更時はキャッシュ再構築
                 if needs_cache_rebuild:
-                    print(f"[INFO] キャッシュ再構築: {self.settings['chunk_frames']}フレーム/チャンク")
                     self.frame_cache = SmartChunkBasedCache(
                         max_size_mb=self.settings['cache_size_mb'],
                         chunk_frames=self.settings['chunk_frames']
                     )
                 else:
-                    # その他の設定変更時は既存キャッシュを維持
                     self.frame_cache = SmartChunkBasedCache(
                         max_size_mb=self.settings['cache_size_mb'],
                         chunk_frames=self.settings.get('chunk_frames', 150)
@@ -2066,7 +2083,6 @@ V1.0 Smart Cache Edition - 高速応答版 :
                 if self.current_video:
                     self.load_video(self.current_video)
                 
-                # ユーザーに通知
                 msg = QMessageBox(self)
                 msg.setWindowTitle("設定変更")
                 if needs_cache_rebuild:
@@ -2075,10 +2091,7 @@ V1.0 Smart Cache Edition - 高速応答版 :
                     msg.setText("処理設定を変更しました。\n再生を再開します。")
                 msg.setIcon(QMessageBox.Icon.Information)
                 msg.exec()
-                
-                print(f"[INFO] 新設定適用完了: {self.settings}")
             else:
-                # 音声設定など軽微な変更
                 self.settings.update(new_settings)
                 self.save_settings()
 
@@ -2093,8 +2106,8 @@ V1.0 Smart Cache Edition - 高速応答版 :
         self.save_settings()
 
     def load_video(self, path):
-        print(f"[INFO] 動画読み込み: {path}")
-        self.fast_stop()
+        print(f"[MAIN] 動画読み込み: {path}")
+        self.safe_stop()
         self.frame_cache.clear()
         self.video_widget.clear_frame()
         
@@ -2112,12 +2125,10 @@ V1.0 Smart Cache Edition - 高速応答版 :
             try:
                 self.original_capture = cv2.VideoCapture(str(path))
                 if not self.original_capture.isOpened():
-                    print("[ERROR] 元動画の読み込みに失敗")
+                    print("[MAIN] 元動画の読み込みに失敗")
                     self.original_capture = None
-                else:
-                    print("[DEBUG] 元動画キャプチャ作成成功")
             except Exception as e:
-                print(f"[ERROR] 元動画キャプチャ作成失敗: {e}")
+                print(f"[MAIN] 元動画キャプチャ作成失敗: {e}")
                 self.original_capture = None
         
         try:
@@ -2139,7 +2150,7 @@ V1.0 Smart Cache Edition - 高速応答版 :
             self.video_widget.set_video_info(self.total_frames, self.video_fps)
             
         except Exception as e:
-            print(f"[ERROR] 動画メタデータ取得失敗: {e}")
+            print(f"[MAIN] 動画メタデータ取得失敗: {e}")
             self.total_frames = 0
             self.video_fps = 30.0
         
@@ -2151,16 +2162,15 @@ V1.0 Smart Cache Edition - 高速応答版 :
         if not self.current_video:
             return
         
-        print(f"[DEBUG] フレーム{start_frame}から再生開始 (AI処理: {self.ai_processing_enabled})")
+        print(f"[MAIN] フレーム{start_frame}から再生開始 (AI処理: {self.ai_processing_enabled})")
         
         # 既存のスレッド/タイマーが残っていないか確認
         if hasattr(self, 'process_thread') and self.process_thread and self.process_thread.isRunning():
-            print("[WARNING] 既存のAIスレッドが動作中です。停止します。")
-            self.process_thread._stop_flag = True
-            self.process_thread.wait(100)
+            print("[MAIN] 既存のAIスレッドが動作中です。安全停止します。")
+            self.process_thread.safe_stop()
         
         if hasattr(self, 'original_timer') and self.original_timer and self.original_timer.isActive():
-            print("[WARNING] 既存の原画タイマーが動作中です。停止します。")
+            print("[MAIN] 既存の原画タイマーが動作中です。停止します。")
             self.original_timer.stop()
         
         # AI処理無効時はOpenCVで直接再生
@@ -2175,7 +2185,7 @@ V1.0 Smart Cache Edition - 高速応答版 :
         
         # スレッドが既に動作していないか再確認
         if self.process_thread and self.process_thread.isRunning():
-            print("[ERROR] スレッドがまだ動作しています。処理を中止します。")
+            print("[MAIN] スレッドがまだ動作しています。処理を中止します。")
             return
         
         model_dir = LADA_BASE_PATH / "model_weights"
@@ -2217,11 +2227,11 @@ V1.0 Smart Cache Edition - 高速応答版 :
         self.mode_label.setText("📊 モード: 🔄 AI処理中")
         self.video_widget.set_progress_bar_color('#00ff00')
         
-        print(f"[DEBUG] AI処理スレッド開始完了: ID{current_id}")
+        print(f"[MAIN] AI処理スレッド開始完了: ID{current_id}")
 
     def start_original_playback(self, start_frame):
         """AI処理無効時の元動画再生"""
-        print(f"[DEBUG] 原画再生開始: フレーム{start_frame}")
+        print(f"[MAIN] 原画再生開始: フレーム{start_frame}")
         
         # 既存のキャプチャとタイマーを確実にクリーンアップ
         if hasattr(self, 'original_capture') and self.original_capture:
@@ -2236,11 +2246,11 @@ V1.0 Smart Cache Edition - 高速応答版 :
         try:
             self.original_capture = cv2.VideoCapture(str(self.current_video))
             if not self.original_capture.isOpened():
-                print("[ERROR] 元動画の読み込みに失敗")
+                print("[MAIN] 元動画の読み込みに失敗")
                 self.mode_label.setText("エラー: 動画読み込み失敗")
                 return
         except Exception as e:
-            print(f"[ERROR] 元動画キャプチャ作成失敗: {e}")
+            print(f"[MAIN] 元動画キャプチャ作成失敗: {e}")
             self.mode_label.setText("エラー: 動画読み込み失敗")
             return
         
@@ -2270,7 +2280,7 @@ V1.0 Smart Cache Edition - 高速応答版 :
             start_sec = start_frame / self.video_fps if self.video_fps > 0 else 0
             self.audio_thread.start_playback(str(self.current_video), start_sec)
         
-        print(f"[DEBUG] 原画再生開始完了: フレーム{start_frame}, 間隔{frame_interval}ms")
+        print(f"[MAIN] 原画再生開始完了: フレーム{start_frame}, 間隔{frame_interval}ms")
 
     def update_original_frame(self):
         if not hasattr(self, 'original_capture') or not self.original_capture or not self.is_playing or self.is_paused:
@@ -2298,16 +2308,14 @@ V1.0 Smart Cache Edition - 高速応答版 :
                 self.is_playing = False
                 self.play_pause_btn.setText("▶ 再生")
                 self.mode_label.setText("📊 モード: 🎥 再生完了")
-                print("[DEBUG] 原画再生完了")
         else:
             self.original_timer.stop()
             self.is_playing = False
             self.play_pause_btn.setText("▶ 再生")
             self.mode_label.setText("📊 モード: 🎥 再生完了")
-            print("[DEBUG] 原画再生終了")
 
     def toggle_playback(self):
-        """高速な再生/一時停止トグル"""
+        """安全な再生/一時停止トグル"""
         if not self.ai_processing_enabled and hasattr(self, 'original_timer'):
             if self.is_paused:
                 self.original_timer.start()
@@ -2348,9 +2356,9 @@ V1.0 Smart Cache Edition - 高速応答版 :
             self.mode_label.setText("📊 モード: ⏸ 一時停止中")
             self.video_widget.set_progress_bar_color('red')
 
-    def fast_stop(self):
-        """高速停止 - 最小限のクリーンアップのみ実行"""
-        print("[FAST-STOP] 高速停止実行")
+    def safe_stop(self):
+        """安全な停止 - デッドロック防止"""
+        print("[MAIN] 安全停止開始")
         
         # 状態フラグのみ設定
         self.is_playing = False
@@ -2364,22 +2372,29 @@ V1.0 Smart Cache Edition - 高速応答版 :
             self.original_capture.release()
             self.original_capture = None
         
-        # AI処理スレッドの停止（軽量）
+        # AI処理スレッドの安全な停止
         if hasattr(self, 'process_thread') and self.process_thread:
-            self.process_thread._stop_flag = True
-            self.process_thread.wait(100)  # 短い待機時間
+            self.process_thread.safe_stop()
+            self.process_thread = None
         
         # UI状態リセット
         self.play_pause_btn.setText("▶ 再生")
         self.play_pause_btn.setEnabled(self.current_video is not None)
         
-        print("[FAST-STOP] 高速停止完了")
+        print("[MAIN] 安全停止完了")
 
 
 def main():
     app = QApplication(sys.argv)
     player = LadaFinalPlayer()
     player.show()
+    
+    # アプリケーション終了時の安全確保
+    def safe_quit():
+        player.close()
+    
+    app.aboutToQuit.connect(safe_quit)
+    
     sys.exit(app.exec())
 
 
