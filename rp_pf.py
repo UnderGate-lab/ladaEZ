@@ -117,7 +117,7 @@ class SettingsDialog(QDialog):
 
 
 class SmartChunkBasedCache:
-    """30FPS最適化スマートキャッシュ（デッドロック対策版）"""
+    """30FPS最適化スマートキャッシュ - モザイク検出&インテリジェント削除版"""
     
     def __init__(self, max_size_mb=12288, chunk_frames=150):
         self.chunk_frames = chunk_frames
@@ -127,7 +127,7 @@ class SmartChunkBasedCache:
         # チャンク管理
         self.chunks = {}  # chunk_id -> {'frames': dict, 'size_mb': float, 'last_access': float}
         self.access_order = deque()  # LRU順序
-        self.mutex = QMutex()  # 通常のミューテックス
+        self.mutex = QMutex()
         
         # 処理コスト追跡
         self.processing_costs = {}  # chunk_id -> cost_data
@@ -141,14 +141,23 @@ class SmartChunkBasedCache:
             'total_processing_time': 0.0
         }
         
+        # モザイク検出システム
+        self.mosaic_detected = False
+        self.consecutive_slow_frames = 0
+        self.consecutive_fast_frames = 0
+        self.slow_frame_threshold = 3      # モザイク検出の連続フレーム数
+        self.fast_frame_threshold = 5      # モザイク解除の連続フレーム数
+        self.mosaic_threshold_ms = 80.0    # モザイク判定閾値
+        self.fast_threshold_ms = 40.0      # 高速判定閾値
+        self.last_mosaic_change_time = 0   # 最後のモザイク状態変化時間
+        
+        # インテリジェント削除用データ
+        self.chunk_access_count = {}       # チャンクごとのアクセス回数
+        self.previous_playhead = 0         # 前回の再生位置（シーク方向検出用）
+        
         # 予測的先読み
         self.prefetch_queue = deque()
         self.prefetch_enabled = True
-        
-        # デバッグ制御
-        self.debug_enabled = False
-        self.last_debug_output = 0
-        self.debug_interval = 5.0  # 5秒ごとにデバッグ出力
         
         # 非同期クリーンアップ
         self.cleanup_timer = QTimer()
@@ -159,7 +168,7 @@ class SmartChunkBasedCache:
         # 再生状態
         self.current_playhead = 0
         
-        print(f"[SMART-CACHE] 初期化: {max_size_mb}MB, チャンク={chunk_frames}フレーム, デッドロック対策版")
+        print(f"[SMART-CACHE] 最適化版 初期化: {max_size_mb}MB, 閾値={self.mosaic_threshold_ms}ms")
 
     def get_chunk_id(self, frame_num):
         """フレーム番号からチャンクIDを計算"""
@@ -171,15 +180,19 @@ class SmartChunkBasedCache:
         end_frame = start_frame + self.chunk_frames - 1
         return start_frame, end_frame
 
+    def should_cache_frame(self, frame_num, frame_data=None):
+        """基本FALSE、モザイク検出時のみTRUE"""
+        return self.mosaic_detected
+
     def record_frame_processing_time(self, frame_num, processing_time):
-        """フレーム処理時間を記録（最小オーバーヘッド）"""
-        chunk_id = self.get_chunk_id(frame_num)
-        
-        # ロック時間を最小限に
-        if not self.mutex.tryLock(10):  # 10msタイムアウト
+        """処理時間からモザイク状態を検出"""
+        if not self.mutex.tryLock(10):
             return
             
         try:
+            chunk_id = self.get_chunk_id(frame_num)
+            
+            # 処理時間の記録
             if chunk_id not in self.processing_costs:
                 self.processing_costs[chunk_id] = {
                     'frame_times': [],
@@ -194,82 +207,94 @@ class SmartChunkBasedCache:
             cost_data['sample_count'] += 1
             cost_data['last_sample_time'] = time.time()
             
+            # スマートモザイク検出
+            current_ms = processing_time * 1000
+            mosaic_state_changed = self._update_mosaic_state(current_ms, frame_num)
+            
+            # ポリシー更新（互換性のため）
+            if cost_data['sample_count'] >= 2:
+                self._update_chunk_policy(chunk_id)
+            
             # 統計更新
             self.performance_stats['total_frames'] += 1
             self.performance_stats['total_processing_time'] += processing_time
             
-            # 3サンプル以上でポリシー更新（高速判定）
-            if cost_data['sample_count'] == 3:
-                self._update_chunk_policy(chunk_id)
+            # デバッグ出力（状態変化時のみ）
+            if mosaic_state_changed:
+                self._debug_mosaic_state()
+                
         finally:
             self.mutex.unlock()
 
+    def _update_mosaic_state(self, current_ms, frame_num):
+        """モザイク状態を更新し、変化があったかを返す"""
+        previous_state = self.mosaic_detected
+        state_changed = False
+        
+        if current_ms >= self.mosaic_threshold_ms:
+            # 低速フレーム（モザイクの可能性）
+            self.consecutive_slow_frames += 1
+            self.consecutive_fast_frames = 0
+            
+            # 連続で低速ならモザイク検出
+            if (self.consecutive_slow_frames >= self.slow_frame_threshold and 
+                not self.mosaic_detected):
+                self.mosaic_detected = True
+                state_changed = True
+                self.last_mosaic_change_time = time.time()
+                
+        elif current_ms <= self.fast_threshold_ms:
+            # 高速フレーム（モザイクなしの可能性）
+            self.consecutive_fast_frames += 1
+            self.consecutive_slow_frames = 0
+            
+            # 連続で高速ならモザイク解除
+            if (self.consecutive_fast_frames >= self.fast_frame_threshold and 
+                self.mosaic_detected):
+                self.mosaic_detected = False
+                state_changed = True
+                self.last_mosaic_change_time = time.time()
+        
+        else:
+            # 中間領域 - 状態を維持
+            pass
+            
+        return state_changed
+
+    def _debug_mosaic_state(self):
+        """モザイク状態のデバッグ出力"""
+        state = "🔍 モザイク検出" if self.mosaic_detected else "✅ モザイクなし"
+        slow_str = f"遅:{self.consecutive_slow_frames}" if self.consecutive_slow_frames > 0 else ""
+        fast_str = f"速:{self.consecutive_fast_frames}" if self.consecutive_fast_frames > 0 else ""
+        counter_str = f" ({slow_str}{fast_str})".strip()
+        
+        print(f"[CACHE] {state}{counter_str}")
+
     def _update_chunk_policy(self, chunk_id):
-        """高速なキャッシュポリシー決定"""
+        """互換性のためのポリシー更新"""
         cost_data = self.processing_costs[chunk_id]
         avg_ms_per_frame = (cost_data['total_time'] / cost_data['sample_count']) * 1000
         
-        # 超高速判定（分岐最小化）
-        if avg_ms_per_frame <= 33.3:
-            policy, priority = 'no_cache', 0
-        elif avg_ms_per_frame <= 50.0:
-            policy, priority = 'short_term', 1
-        elif avg_ms_per_frame <= 100.0:
-            policy, priority = 'standard_cache', 2
+        # モザイク状態に基づいてポリシー決定
+        if self.mosaic_detected:
+            if avg_ms_per_frame <= 100.0:
+                policy, priority = 'standard_cache', 2
+            else:
+                policy, priority = 'priority_cache', 3
         else:
-            policy, priority = 'priority_cache', 3
-        
-        # 簡易平滑化（近傍2チャンクのみチェック）
-        smoothed_policy = self._fast_temporal_smoothing(chunk_id, policy, priority)
+            policy, priority = 'no_cache', 0
         
         self.cache_policies[chunk_id] = {
-            'policy': smoothed_policy['policy'],
-            'priority': smoothed_policy['priority'],
+            'policy': policy,
+            'priority': priority,
             'avg_ms_per_frame': avg_ms_per_frame,
             'sample_size': cost_data['sample_count'],
             'last_updated': time.time()
         }
 
-    def _fast_temporal_smoothing(self, chunk_id, proposed_policy, proposed_priority):
-        """高速な時空間平滑化"""
-        # 近傍1チャンクのみチェック（高速化）
-        neighbors = []
-        for offset in [-1, 1]:
-            neighbor_id = chunk_id + offset
-            if neighbor_id in self.cache_policies:
-                neighbors.append(self.cache_policies[neighbor_id])
-        
-        if len(neighbors) >= 1:
-            # シンプルな多数決
-            policy_counts = {}
-            for neighbor in neighbors:
-                policy = neighbor['policy']
-                policy_counts[policy] = policy_counts.get(policy, 0) + 1
-            
-            most_common = max(policy_counts.items(), key=lambda x: x[1])
-            if most_common[1] >= len(neighbors) and most_common[0] != proposed_policy:
-                return {'policy': most_common[0], 'priority': proposed_priority}
-        
-        return {'policy': proposed_policy, 'priority': proposed_priority}
-
-    def should_cache_frame(self, frame_num, frame_data=None):
-        """フレームをキャッシュすべきか判定"""
-        chunk_id = self.get_chunk_id(frame_num)
-        
-        if chunk_id not in self.cache_policies:
-            return True  # 未知はデフォルトでキャッシュ
-        
-        policy = self.cache_policies[chunk_id]
-        
-        # TTLチェック（簡略化）
-        if policy['policy'] == 'no_cache':
-            return False
-        
-        return policy['policy'] != 'no_cache'
-
     def get(self, frame_num):
-        """フレーム取得 - デッドロック対策"""
-        if not self.mutex.tryLock(10):  # 10msでタイムアウト
+        """フレーム取得 - アクセスカウントを記録"""
+        if not self.mutex.tryLock(10):
             return None
             
         try:
@@ -282,6 +307,9 @@ class SmartChunkBasedCache:
                     chunk['last_access'] = time.time()
                     self._update_access_order(chunk_id)
                     
+                    # アクセスカウント更新
+                    self.chunk_access_count[chunk_id] = self.chunk_access_count.get(chunk_id, 0) + 1
+                    
                     # 統計更新
                     self.performance_stats['cache_hits'] += 1
                     return chunk['frames'][frame_num]
@@ -293,8 +321,8 @@ class SmartChunkBasedCache:
             self.mutex.unlock()
 
     def put(self, frame_num, frame):
-        """スマートキャッシュ判定付きのフレーム追加 - デッドロック対策"""
-        if not self.mutex.tryLock(10):  # 10msでタイムアウト
+        """モザイク検出時のみフレームをキャッシュ"""
+        if not self.mutex.tryLock(10):
             return
             
         try:
@@ -302,7 +330,7 @@ class SmartChunkBasedCache:
                 self._remove_frame(frame_num)
                 return
                 
-            # スマートキャッシュ判定
+            # モザイク検出時のみキャッシュ
             if not self.should_cache_frame(frame_num, frame):
                 return
                 
@@ -338,6 +366,7 @@ class SmartChunkBasedCache:
             # 容量超過時は非同期クリーンアップをスケジュール
             if self.current_size_mb > self.max_size_mb:
                 self._schedule_async_cleanup()
+                
         finally:
             self.mutex.unlock()
 
@@ -351,18 +380,18 @@ class SmartChunkBasedCache:
         """非同期クリーンアップをスケジュール"""
         if not self.pending_cleanup and not self.cleanup_timer.isActive():
             self.pending_cleanup = True
-            self.cleanup_timer.start(50)  # 50ms後に実行
+            self.cleanup_timer.start(50)
 
     def _async_cleanup(self):
-        """非同期でチャンク単位のクリーンアップを実行 - デッドロック対策"""
+        """インテリジェントな非同期クリーンアップ"""
         if not self.pending_cleanup:
             return
             
         start_time = time.time()
         removed_count = 0
         
-        if not self.mutex.tryLock(50):  # 50msでタイムアウト
-            self.cleanup_timer.start(25)  # 再試行
+        if not self.mutex.tryLock(50):
+            self.cleanup_timer.start(25)
             return
             
         try:
@@ -370,72 +399,115 @@ class SmartChunkBasedCache:
                 self.pending_cleanup = False
                 return
             
-            # 保護対象のチャンクを計算（優先度考慮）
+            # 保護対象のチャンク
             protected_chunks = self._get_protected_chunks()
             
-            # 優先度の低いチャンクから削除
-            chunks_to_remove = []
-            for chunk_id in list(self.access_order):
-                if (chunk_id not in protected_chunks and 
-                    self._get_chunk_cleanup_priority(chunk_id) <= 1):  # 低優先度
-                    chunks_to_remove.append(chunk_id)
+            # 削除候補を優先度順にソート
+            candidate_chunks = self._get_cleanup_candidates(protected_chunks)
             
-            # それでも足りない場合は標準優先度を対象に
-            if self.current_size_mb > self.max_size_mb * 0.8:
-                for chunk_id in list(self.access_order):
-                    if (chunk_id not in protected_chunks and 
-                        chunk_id not in chunks_to_remove and
-                        self._get_chunk_cleanup_priority(chunk_id) <= 2):  # 標準優先度以下
-                        chunks_to_remove.append(chunk_id)
-            
-            # 削除実行
-            for chunk_id in chunks_to_remove:
+            # 優先度の高いものから削除
+            for chunk_id, priority_score in candidate_chunks:
                 if self._remove_chunk(chunk_id):
                     removed_count += 1
+                    print(f"[CACHE] クリーンアップ: チャンク{chunk_id}削除 (優先度: {priority_score:.3f})")
+                    
                     if self.current_size_mb <= self.max_size_mb * 0.7:
                         break
-                    if removed_count >= 2:  # 一度に削除する数を減らして高速化
+                    if removed_count >= 3:  # 一度に削除する数を制限
                         break
             
             # 必要に応じて継続
             if self.current_size_mb > self.max_size_mb * 0.8:
+                print(f"[CACHE] クリーンアップ継続: {self.current_size_mb:.1f}MB > {self.max_size_mb * 0.8:.1f}MB")
                 self.cleanup_timer.start(25)
             else:
                 self.pending_cleanup = False
+                print(f"[CACHE] クリーンアップ完了: {removed_count}チャンク削除, 現在 {self.current_size_mb:.1f}MB")
+                
         finally:
             self.mutex.unlock()
 
-    def _get_chunk_cleanup_priority(self, chunk_id):
-        """クリーンアップ時の優先度（低いほど先に削除）"""
-        if chunk_id not in self.cache_policies:
-            return 0  # 未知は最低優先度
+    def _get_cleanup_candidates(self, protected_chunks):
+        """削除候補のチャンクを優先度順にソートして返す"""
+        candidates = []
         
-        policy = self.cache_policies[chunk_id]
+        for chunk_id in list(self.access_order):
+            if chunk_id in protected_chunks:
+                continue
+                
+            # 削除優先度を計算（高いほど削除されやすい）
+            priority_score = self._calculate_cleanup_priority(chunk_id)
+            candidates.append((chunk_id, priority_score))
         
-        # ポリシーに基づく優先度（数値が小さいほど削除されやすい）
-        priority_map = {
-            'no_cache': 0,
-            'short_term': 1, 
-            'standard_cache': 2,
-            'priority_cache': 3
-        }
+        # 優先度の高い順（削除されやすい順）にソート
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return candidates
+
+    def _calculate_cleanup_priority(self, chunk_id):
+        """チャンクの削除優先度を計算"""
+        # 基本スコア
+        base_score = 0.0
         
-        return priority_map.get(policy['policy'], 0)
+        # 1. モザイク含有率（モザイクが少ないほど削除されやすい）
+        mosaic_ratio = self._get_chunk_mosaic_ratio(chunk_id)
+        base_score += (1.0 - mosaic_ratio) * 0.5
+        
+        # 2. アクセス頻度（アクセスが少ないほど削除されやすい）
+        access_count = self.chunk_access_count.get(chunk_id, 0)
+        access_factor = 1.0 / (access_count + 1)
+        base_score += access_factor * 0.3
+        
+        # 3. 最終アクセス時間（古いほど削除されやすい）
+        if chunk_id in self.chunks:
+            time_since_access = time.time() - self.chunks[chunk_id]['last_access']
+            time_factor = min(time_since_access / 300.0, 1.0)  # 5分で最大
+            base_score += time_factor * 0.2
+        
+        return base_score
+
+    def _get_chunk_mosaic_ratio(self, chunk_id):
+        """チャンク内のモザイクフレームの割合を計算"""
+        if chunk_id not in self.chunks:
+            return 0.0
+        
+        chunk = self.chunks[chunk_id]
+        mosaic_frames = 0
+        total_frames = len(chunk['frames'])
+        
+        if total_frames == 0:
+            return 0.0
+        
+        # チャンク内のフレームからモザイク判定
+        for frame_num in chunk['frames']:
+            frame_chunk_id = self.get_chunk_id(frame_num)
+            if frame_chunk_id in self.processing_costs:
+                cost_data = self.processing_costs[frame_chunk_id]
+                if cost_data['sample_count'] > 0:
+                    avg_time = (cost_data['total_time'] / cost_data['sample_count']) * 1000
+                    if avg_time >= self.mosaic_threshold_ms:
+                        mosaic_frames += 1
+        
+        return mosaic_frames / total_frames
 
     def _get_protected_chunks(self):
-        """保護対象のチャンクを計算"""
+        """動的保护範囲を計算"""
         current_chunk = self.get_chunk_id(self.current_playhead)
         protected = set()
         
-        # 現在のチャンクと前後1チャンクを保護（範囲を縮小して高速化）
-        for offset in range(-1, 2):  # -1, 0, 1
+        # 基本的な保護範囲（前後2チャンク）
+        for offset in range(-2, 3):
             protected.add(current_chunk + offset)
         
-        # 高優先度チャンクを追加保護
-        for chunk_id in list(self.chunks.keys()):
-            if self._get_chunk_cleanup_priority(chunk_id) >= 3:  # 高優先度
-                protected.add(chunk_id)
-                
+        # シーク方向を考慮した追加保護
+        seek_direction = self.current_playhead - self.previous_playhead
+        if abs(seek_direction) > self.chunk_frames:  # 大きなシークの場合
+            if seek_direction > 0:  # 前方シーク
+                for offset in range(1, 4):
+                    protected.add(current_chunk + offset)
+            elif seek_direction < 0:  # 後方シーク
+                for offset in range(-4, 0):
+                    protected.add(current_chunk + offset)
+        
         return protected
 
     def _remove_chunk(self, chunk_id):
@@ -443,16 +515,19 @@ class SmartChunkBasedCache:
         if chunk_id in self.chunks:
             chunk = self.chunks[chunk_id]
             self.current_size_mb -= chunk['size_mb']
-            del self.chunks[chunk_id]
             
+            # 関連データもクリーンアップ
             if chunk_id in self.access_order:
                 self.access_order.remove(chunk_id)
+            if chunk_id in self.chunk_access_count:
+                del self.chunk_access_count[chunk_id]
             
+            del self.chunks[chunk_id]
             return True
         return False
 
     def _remove_frame(self, frame_num):
-        """単一フレームを削除（特殊ケース用）"""
+        """単一フレームを削除"""
         chunk_id = self.get_chunk_id(frame_num)
         if chunk_id in self.chunks:
             chunk = self.chunks[chunk_id]
@@ -464,17 +539,17 @@ class SmartChunkBasedCache:
                 chunk['size_mb'] -= frame_size_mb
                 self.current_size_mb -= frame_size_mb
                 
-                # チャンクが空になったら完全削除
                 if not chunk['frames']:
                     self._remove_chunk(chunk_id)
 
     def update_playhead(self, frame_num):
-        """再生位置を更新（保護対象の計算用）"""
+        """再生位置を更新（シーク方向検出用）"""
+        self.previous_playhead = self.current_playhead
         self.current_playhead = frame_num
 
     def clear(self):
-        """キャッシュ全クリア - デッドロック対策"""
-        if not self.mutex.tryLock(100):  # 100msでタイムアウト
+        """キャッシュ全クリア"""
+        if not self.mutex.tryLock(100):
             print("[WARNING] キャッシュクリア: ミューテックスの取得に失敗")
             return
             
@@ -485,57 +560,78 @@ class SmartChunkBasedCache:
             self.pending_cleanup = False
             self.cleanup_timer.stop()
             
-            # スマートキャッシュ関連もクリア
+            # 状態リセット
             self.processing_costs.clear()
             self.cache_policies.clear()
             self.prefetch_queue.clear()
+            self.chunk_access_count.clear()
+            
+            # モザイク状態リセット
+            self.mosaic_detected = False
+            self.consecutive_slow_frames = 0
+            self.consecutive_fast_frames = 0
+            self.last_mosaic_change_time = 0
+            self.previous_playhead = 0
+            self.current_playhead = 0
+            
             self.performance_stats = {
                 'cache_hits': 0,
                 'cache_misses': 0,
                 'total_frames': 0,
                 'total_processing_time': 0.0
             }
+            
+            print("[CACHE] キャッシュ完全クリア")
         finally:
             self.mutex.unlock()
 
     def get_stats(self):
-        """キャッシュ統計を取得 - デッドロック対策"""
+        """詳細なキャッシュ統計を取得"""
         if not self.mutex.tryLock(10):
-            return {
-                'chunk_count': 0,
-                'total_frames': 0,
-                'size_mb': 0,
-                'max_mb': self.max_size_mb,
-                'chunk_frames': self.chunk_frames,
-                'hit_ratio': 0.0,
-                'avg_processing_time': 0.0,
-                'policy_distribution': {}
-            }
+            return self._get_default_stats()
             
         try:
             chunk_count = len(self.chunks)
             total_frames = sum(len(chunk['frames']) for chunk in self.chunks.values())
+            
+            # モザイクチャンクの統計
+            mosaic_chunks = 0
+            total_mosaic_ratio = 0.0
+            for chunk_id in self.chunks:
+                mosaic_ratio = self._get_chunk_mosaic_ratio(chunk_id)
+                total_mosaic_ratio += mosaic_ratio
+                if mosaic_ratio > 0.5:  # 50%以上モザイクを含む
+                    mosaic_chunks += 1
+            
+            avg_mosaic_ratio = total_mosaic_ratio / chunk_count if chunk_count > 0 else 0.0
             
             stats = {
                 'chunk_count': chunk_count,
                 'total_frames': total_frames,
                 'size_mb': self.current_size_mb,
                 'max_mb': self.max_size_mb,
-                'chunk_frames': self.chunk_frames
+                'chunk_frames': self.chunk_frames,
+                'mosaic_detected': self.mosaic_detected,
+                'consecutive_slow': self.consecutive_slow_frames,
+                'consecutive_fast': self.consecutive_fast_frames,
+                'mosaic_chunks': mosaic_chunks,
+                'avg_mosaic_ratio': avg_mosaic_ratio
             }
             
-            # スマートキャッシュ統計を追加
+            # ヒット率計算
             total_requests = self.performance_stats['cache_hits'] + self.performance_stats['cache_misses']
             if total_requests > 0:
                 stats['hit_ratio'] = self.performance_stats['cache_hits'] / total_requests
             else:
                 stats['hit_ratio'] = 0.0
                 
+            # 平均処理時間
             if self.performance_stats['total_frames'] > 0:
                 stats['avg_processing_time'] = (self.performance_stats['total_processing_time'] / self.performance_stats['total_frames']) * 1000
             else:
                 stats['avg_processing_time'] = 0.0
                 
+            # ポリシー分布
             stats['policy_distribution'] = {}
             for policy in self.cache_policies.values():
                 policy_name = policy['policy']
@@ -545,6 +641,23 @@ class SmartChunkBasedCache:
         finally:
             self.mutex.unlock()
 
+    def _get_default_stats(self):
+        """デフォルト統計（ロック失敗時用）"""
+        return {
+            'chunk_count': 0,
+            'total_frames': 0,
+            'size_mb': 0,
+            'max_mb': self.max_size_mb,
+            'chunk_frames': self.chunk_frames,
+            'hit_ratio': 0.0,
+            'avg_processing_time': 0.0,
+            'policy_distribution': {},
+            'mosaic_detected': False,
+            'consecutive_slow': 0,
+            'consecutive_fast': 0,
+            'mosaic_chunks': 0,
+            'avg_mosaic_ratio': 0.0
+        }
 
 class VideoGLWidget(QOpenGLWidget):
     playback_toggled = pyqtSignal()
@@ -1923,10 +2036,10 @@ class LadaFinalPlayer(QMainWindow):
         info.setReadOnly(True)
         info.setMaximumHeight(100)
         info.setText("""
-V1.1 20251009 : 
+V1.1 20251009-3 : 
 操作: F=フルスクリーントグル | Space=再生/停止 | M=ミュートトグル | X=AI処理トグル | 進捗バークリックでシーク
 新機能: S=先頭/範囲開始 | E=末尾/範囲終了 | 1-9=10%-90%移動 | Ctrl+S=範囲開始点 | Ctrl+E=範囲終了点 | Ctrl+R=範囲リセット | Ctrl+P=範囲再生モードトグル
-制限事項: 音声不安定、メモリリーク、範囲機能不具合
+制限事項: 音声不安定、範囲機能不具合
 """)
         layout.addWidget(info)
         
