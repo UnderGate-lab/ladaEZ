@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LADA REALTIME PLAYER V1.0 - Smart Cache Edition - デッドロック修正版
+LADA REALTIME PLAYER V1.1
 """
 
 import sys
@@ -552,6 +552,13 @@ class VideoGLWidget(QOpenGLWidget):
     seek_requested = pyqtSignal(int)
     toggle_mute_signal = pyqtSignal()
     toggle_ai_processing_signal = pyqtSignal()
+    set_range_start_signal = pyqtSignal()
+    set_range_end_signal = pyqtSignal()
+    reset_range_signal = pyqtSignal()
+    seek_to_start_signal = pyqtSignal()
+    seek_to_end_signal = pyqtSignal()
+    seek_to_percentage_signal = pyqtSignal(int)
+    toggle_range_mode_signal = pyqtSignal()
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -575,7 +582,7 @@ class VideoGLWidget(QOpenGLWidget):
             QProgressBar {
                 background-color: rgba(40, 40, 40, 200);
                 border: none;
-                height: 8px;
+                height: 38px;  /* 約10mm */
             }
             QProgressBar::chunk {
                 background-color: #00ff00;
@@ -647,7 +654,7 @@ class VideoGLWidget(QOpenGLWidget):
         if not self.is_fullscreen:
             return
             
-        bar_height = 8
+        bar_height = 38  # 約10mm
         bar_margin = 20
         self.fs_progress_bar.setGeometry(
             bar_margin, 
@@ -761,12 +768,32 @@ class VideoGLWidget(QOpenGLWidget):
                 self.toggle_mute_signal.emit()
             elif key == Qt.Key.Key_X:
                 self.toggle_ai_processing_signal.emit()
+            elif key == Qt.Key.Key_S:
+                if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                    self.set_range_start_signal.emit()
+                else:
+                    self.seek_to_start_signal.emit()
+            elif key == Qt.Key.Key_E:
+                if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                    self.set_range_end_signal.emit()
+                else:
+                    self.seek_to_end_signal.emit()
+            elif key == Qt.Key.Key_R and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                self.reset_range_signal.emit()
+            elif Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
+                # 数字キー1-9の処理
+                percent = key - Qt.Key.Key_0  # 1-9を取得
+                self.seek_to_percentage_signal.emit(percent)
+            elif key == Qt.Key.Key_P and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                self.toggle_range_mode_signal.emit()
         else:
             key = event.key()
             if key == Qt.Key.Key_M:
                 self.toggle_mute_signal.emit()
             elif key == Qt.Key.Key_X:
                 self.toggle_ai_processing_signal.emit()
+            elif key == Qt.Key.Key_P and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                self.toggle_range_mode_signal.emit()
             else:
                 super().keyPressEvent(event)
     
@@ -954,7 +981,7 @@ class VideoGLWidget(QOpenGLWidget):
             QProgressBar {{
                 background-color: rgba(40, 40, 40, 200);
                 border: none;
-                height: 8px;
+                height: 38px;
             }}
             QProgressBar::chunk {{
                 background-color: {color};
@@ -999,7 +1026,8 @@ class OptimizedFrameRestorer:
         
         print(f"[OPTIMIZE] Queue: {max_frames}f, {max_clips}c ({queue_size_mb}MB)")
         print(f"[OPTIMIZE] Batch size: {self._parent.batch_size}")
-    
+
+
     def start(self, start_ns=0):
         return self._parent.start(start_ns)
     
@@ -1011,6 +1039,254 @@ class OptimizedFrameRestorer:
     
     def __next__(self):
         return self._parent.__next__()
+
+
+class AudioThread(QThread):
+    def __init__(self, vlc_instance, initial_volume=100, is_muted=False):
+        super().__init__()
+        self.vlc_instance = vlc_instance
+        self.player = self.vlc_instance.media_player_new()
+        self._stop_flag = False
+        self._is_paused = True
+        self.volume = initial_volume
+        self.user_muted = is_muted
+        self.internal_muted = False
+        self._seek_in_progress = False
+        self._seek_mutex = QMutex()
+        self._operation_mutex = QMutex()
+        self.current_media_path = None
+        
+        # VLCのバッファ設定を最適化
+        self.player.set_rate(1.0)  # 再生速度を正常に
+        
+        self.player.audio_set_volume(self.volume)
+        self._update_vlc_mute_state()
+        
+        print(f"[AUDIO] AudioThread初期化: Volume={self.volume}, Mute={self.user_muted}")
+
+    def run(self):
+        """メインループ - 軽量化"""
+        while not self._stop_flag:
+            time.sleep(0.1)
+
+    def _safe_operation(self, operation, operation_name=""):
+        """安全な操作ラッパー"""
+        if not self._operation_mutex.tryLock(50):  # 50msタイムアウト
+            print(f"[AUDIO] {operation_name}: 操作ミューテックス取得失敗")
+            return False
+            
+        try:
+            operation()
+            return True
+        except Exception as e:
+            print(f"[AUDIO] {operation_name}エラー: {e}")
+            return False
+        finally:
+            self._operation_mutex.unlock()
+
+    def _update_vlc_mute_state(self):
+        if not VLC_AVAILABLE:
+            return
+        should_be_muted = self.user_muted or self.internal_muted
+        try:
+            self.player.audio_set_mute(should_be_muted)
+        except Exception as e:
+            print(f"[AUDIO] ミュート状態更新エラー: {e}")
+
+    def set_internal_mute(self, is_muted):
+        if not VLC_AVAILABLE:
+            return
+        self.internal_muted = is_muted
+        self._update_vlc_mute_state()
+
+    def start_playback(self, video_path, start_sec=0.0):
+        """再生開始 - 信頼性向上版"""
+        if not VLC_AVAILABLE or self._stop_flag:
+            return False
+            
+        def _start():
+            try:
+                # 現在の再生を完全停止
+                if self.player.get_state() != vlc.State.Stopped:
+                    self.player.stop()
+                    time.sleep(0.02)
+                
+                self.current_media_path = video_path
+                media = self.vlc_instance.media_new(video_path)
+                self.player.set_media(media)
+                
+                # 内部ミュートを設定して再生開始
+                self.set_internal_mute(True)
+                self.player.play()
+                
+                # 再生開始を待機（タイムアウト付き）
+                for i in range(30):  # 最大3秒
+                    state = self.player.get_state()
+                    if state in (vlc.State.Playing, vlc.State.Paused):
+                        break
+                    if state == vlc.State.Error:
+                        print("[AUDIO] 再生開始エラー状態")
+                        return False
+                    time.sleep(0.1)
+                
+                # シーク処理
+                if start_sec > 0.0:
+                    self._safe_seek(start_sec)
+                
+                # 内部ミュート解除
+                self.set_internal_mute(False)
+                self._is_paused = False
+                
+                print(f"[AUDIO] 再生開始成功: {Path(video_path).name}, 位置: {start_sec:.2f}秒")
+                return True
+                
+            except Exception as e:
+                print(f"[AUDIO] 再生開始例外: {e}")
+                return False
+        
+        return self._safe_operation(_start, "再生開始")
+
+    def _safe_seek(self, seconds):
+        """安全なシーク処理"""
+        if not self._seek_mutex.tryLock(20):  # 20msタイムアウト
+            return False
+            
+        try:
+            self._seek_in_progress = True
+            msec = int(seconds * 1000)
+            
+            # プレイヤー状態チェック
+            state = self.player.get_state()
+            if state not in (vlc.State.Playing, vlc.State.Paused):
+                return False
+            
+            # シーク可能かチェック
+            if not self.player.is_seekable():
+                return False
+            
+            # 内部ミュートを設定してシーク
+            self.set_internal_mute(True)
+            self.player.set_time(msec)
+            time.sleep(0.01)  # シーク安定化
+            self.set_internal_mute(False)
+            
+            return True
+            
+        except Exception as e:
+            print(f"[AUDIO] シーク例外: {e}")
+            return False
+        finally:
+            self._seek_in_progress = False
+            self._seek_mutex.unlock()
+
+    def stop_playback(self):
+        """再生停止 - 確実な停止"""
+        if not VLC_AVAILABLE:
+            return
+            
+        def _stop():
+            try:
+                self._is_paused = True
+                self.player.stop()
+                time.sleep(0.03)  # 停止完了待機
+            except Exception as e:
+                print(f"[AUDIO] 停止例外: {e}")
+        
+        self._safe_operation(_stop, "再生停止")
+
+    def pause_audio(self):
+        """一時停止 - 状態チェック強化"""
+        if not VLC_AVAILABLE or self._is_paused or self._stop_flag:
+            return
+            
+        def _pause():
+            try:
+                state = self.player.get_state()
+                if state == vlc.State.Playing:
+                    self.player.pause()
+                    self._is_paused = True
+                    print("[AUDIO] 音声一時停止")
+            except Exception as e:
+                print(f"[AUDIO] 一時停止例外: {e}")
+        
+        self._safe_operation(_pause, "一時停止")
+
+    def resume_audio(self, start_sec):
+        """再生再開 - 信頼性向上"""
+        if not VLC_AVAILABLE or not self._is_paused or self._stop_flag:
+            return False
+            
+        def _resume():
+            try:
+                state = self.player.get_state()
+                
+                if state == vlc.State.Paused:
+                    # 一時停止中なら再生再開
+                    self.player.play()
+                    time.sleep(0.02)
+                elif state == vlc.State.Stopped:
+                    # 停止中なら新規再生
+                    if self.current_media_path:
+                        return self.start_playback(self.current_media_path, start_sec)
+                    else:
+                        print("[AUDIO] 再生再開エラー: メディアパス不明")
+                        return False
+                
+                # 位置調整
+                if start_sec > 0.0:
+                    self._safe_seek(start_sec)
+                
+                self._is_paused = False
+                print(f"[AUDIO] 音声再生再開: 位置 {start_sec:.2f}秒")
+                return True
+                
+            except Exception as e:
+                print(f"[AUDIO] 再生再開例外: {e}")
+                return False
+        
+        return self._safe_operation(_resume, "再生再開")
+
+    def seek_to_time(self, seconds):
+        """時間指定シーク - 軽量化版"""
+        if not VLC_AVAILABLE or self._stop_flag:
+            return
+        self._safe_seek(seconds)
+
+    def set_volume(self, volume):
+        """音量設定"""
+        if not VLC_AVAILABLE:
+            return
+        try:
+            self.volume = max(0, min(100, volume))
+            self.player.audio_set_volume(self.volume)
+        except Exception as e:
+            print(f"[AUDIO] 音量設定エラー: {e}")
+
+    def toggle_mute(self, is_muted):
+        """ミュート切り替え"""
+        if not VLC_AVAILABLE:
+            return
+        try:
+            self.user_muted = is_muted
+            self._update_vlc_mute_state()
+        except Exception as e:
+            print(f"[AUDIO] ミュート切り替えエラー: {e}")
+
+    def safe_stop(self):
+        """安全な停止 - 完全クリーンアップ"""
+        print("[AUDIO] 安全停止開始")
+        self._stop_flag = True
+        
+        # 最終停止
+        self.stop_playback()
+        
+        # スレッド終了待機
+        if not self.wait(1000):
+            print("[AUDIO] スレッド終了待機タイムアウト")
+            self.terminate()
+            self.wait(500)
+        
+        print("[AUDIO] 安全停止完了")
 
 
 class ProcessThread(QThread):
@@ -1096,7 +1372,7 @@ class ProcessThread(QThread):
             self.pause_mutex.unlock()
 
     def safe_stop(self):
-        """安全な停止 - デッドロック対策"""
+        """安全な停止 - 音声スレッド連携改善"""
         print(f"[THREAD-{self.thread_id}] 安全停止開始")
         self._safe_stop = True
         self._stop_flag = True
@@ -1109,6 +1385,15 @@ class ProcessThread(QThread):
                 self.frame_restorer.stop()
             except Exception as e:
                 print(f"[THREAD-{self.thread_id}] フレームレストーラー停止中の例外: {e}")
+        
+        # 音声スレッドの安全な停止（連携改善）
+        if self.audio_thread:
+            try:
+                # 音声スレッドに停止を通知
+                self.audio_thread.stop_playback()
+                time.sleep(0.05)  # 音声停止の完了待機
+            except Exception as e:
+                print(f"[THREAD-{self.thread_id}] 音声停止中の例外: {e}")
         
         # スレッド終了待機（タイムアウト付き）
         if not self.wait(1000):  # 1秒待機
@@ -1139,6 +1424,13 @@ class ProcessThread(QThread):
             if self._stop_flag or self._safe_stop:
                 return
             
+            # 音声再生開始（スレッド開始時）
+            if self.audio_thread and not self._safe_stop:
+                start_sec = self.start_frame / self.video_fps if self.video_fps > 0 else 0
+                audio_success = self.audio_thread.start_playback(str(self.video_path), start_sec)
+                if not audio_success:
+                    print(f"[THREAD-{self.thread_id}] 音声再生開始失敗")
+            
             detection_model, restoration_model, pad_mode = load_models(
                 device="cuda:0",
                 mosaic_restoration_model_name="basicvsrpp-v1.2",
@@ -1167,6 +1459,7 @@ class ProcessThread(QThread):
             start_ns = int((self.start_frame / self.video_fps) * 1_000_000_000)
             self.frame_restorer.start(start_ns=start_ns)
             
+            # メイン処理ループ
             frame_count = self.start_frame
             start_time = time.time()
             pause_start_time = 0
@@ -1176,17 +1469,12 @@ class ProcessThread(QThread):
             frame_restorer_iter = iter(self.frame_restorer)
             pending_ai_frame = None
             lada_start = time.time()
-            lada_time = 0
             last_mode_was_cached = False
             frame_count_at_reset = self.start_frame
             
             # キャッシュに再生位置を通知
             self.frame_cache.update_playhead(frame_count)
             
-            if self.audio_thread and not self._safe_stop:
-                start_sec = self.start_frame / self.video_fps if self.video_fps > 0 else 0
-                self.audio_thread.start_playback(str(self.video_path), start_sec)
-                
             cache_frames_during_pause = 1800
             paused_cache_count = 0
             
@@ -1198,11 +1486,12 @@ class ProcessThread(QThread):
                 if self._safe_stop:
                     break
                     
-                # シークリクエストチェック（高速）
+                # シークリクエストチェック
                 seek_processed = False
-                if self._seek_mutex.tryLock(1):  # 1msでタイムアウト
+                if self._seek_mutex.tryLock(1):
                     try:
                         if self._seek_requested:
+                            print(f"[THREAD-{self.thread_id}] シーク処理開始: {self._seek_target}")
                             frame_count = self._seek_target
                             self.start_frame = frame_count
                             start_ns = int((frame_count / self.video_fps) * 1_000_000_000)
@@ -1228,10 +1517,10 @@ class ProcessThread(QThread):
                             # キャッシュに再生位置を通知
                             self.frame_cache.update_playhead(frame_count)
                             
-                            # 音声シーク
+                            # 音声シーク（非ブロッキング）
                             if self.audio_thread and not self._safe_stop:
                                 target_sec = frame_count / self.video_fps
-                                self.audio_thread.seek_to_time(target_sec)
+                                QTimer.singleShot(0, lambda: self.audio_thread.seek_to_time(target_sec))
                             
                             self._seek_requested = False
                             seek_processed = True
@@ -1242,7 +1531,7 @@ class ProcessThread(QThread):
                 if seek_processed:
                     continue
                 
-                # フレーム処理開始時間
+                # フレーム処理開始
                 frame_start_time = time.time()
                 
                 # キャッシュに再生位置を定期的に通知
@@ -1250,9 +1539,8 @@ class ProcessThread(QThread):
                     self.frame_cache.update_playhead(frame_count)
                 
                 # 一時停止チェック
-                pause_check_start = time.time()
                 is_paused_check = False
-                if self.pause_mutex.tryLock(1):  # 1msでタイムアウト
+                if self.pause_mutex.tryLock(1):
                     try:
                         is_paused_check = self.is_paused
                     finally:
@@ -1262,7 +1550,6 @@ class ProcessThread(QThread):
                     if pause_start_time == 0:
                         pause_start_time = time.time()
                         paused_cache_count = 0
-                        print(f"[THREAD-{self.thread_id}] 一時停止開始")
                     
                     if paused_cache_count < cache_frames_during_pause:
                         if self.frame_cache.get(frame_count + paused_cache_count) is None:
@@ -1289,6 +1576,7 @@ class ProcessThread(QThread):
                 if self._stop_flag or self._safe_stop:
                     break
                 
+                # フレーム処理（既存のロジック）
                 cached_frame = self.frame_cache.get(frame_count)
                 
                 if cached_frame is not None:
@@ -1321,28 +1609,21 @@ class ProcessThread(QThread):
                     else:
                         try:
                             item = next(frame_restorer_iter)
-                            lada_time = time.time() - lada_start
-                            
                             if item is None:
                                 break
-                            
                             restored_frame, frame_pts = item
-                            lada_start = time.time()
-                            
                         except StopIteration:
                             break
                     
                     final_frame = restored_frame
                     is_cached = False
-                    
-                    # 処理時間計測
                     processing_time = time.time() - frame_start_time
                     
                     # スマートキャッシュに処理時間を記録
                     if hasattr(self.frame_cache, 'record_frame_processing_time'):
                         self.frame_cache.record_frame_processing_time(frame_count, processing_time)
                     
-                    # 条件付きでキャッシュに保存
+                    # キャッシュ保存
                     if hasattr(self.frame_cache, 'should_cache_frame'):
                         if self.frame_cache.should_cache_frame(frame_count, final_frame):
                             self.frame_cache.put(frame_count, final_frame)
@@ -1351,6 +1632,7 @@ class ProcessThread(QThread):
                 
                 last_mode_was_cached = is_cached
                 
+                # フレームレート制御
                 frames_since_reset = frame_count - frame_count_at_reset
                 target_time = frames_since_reset * frame_interval
                 elapsed = time.time() - start_time - total_pause_duration
@@ -1364,19 +1646,21 @@ class ProcessThread(QThread):
                 if wait_time > 0:
                     time.sleep(min(wait_time, 0.1))
                 
-                # フレーム準備シグナル発行（デッドロック防止）
+                # フレーム準備シグナル発行
                 if not self._safe_stop:
                     self.frame_ready.emit(final_frame, frame_count, is_cached)
                 
-                if self.audio_thread and frame_count % (int(self.video_fps) * 10) == 0 and not self._safe_stop:
+                # 音声同期（間隔を長くして負荷軽減）
+                if self.audio_thread and frame_count % (int(self.video_fps) * 30) == 0 and not self._safe_stop:
                     current_sec = frame_count / self.video_fps
-                    self.audio_thread.seek_to_time(current_sec)
+                    QTimer.singleShot(0, lambda: self.audio_thread.seek_to_time(current_sec))
                 
                 frame_count += 1
                 if not self._safe_stop:
                     self.progress_updated.emit(frame_count, self.total_frames)
                 
-                if frame_count % 15 == 0:
+                # FPS更新（間隔を長くして負荷軽減）
+                if frame_count % 30 == 0:
                     elapsed = time.time() - start_time - total_pause_duration
                     actual_fps = (frame_count - self.start_frame) / elapsed if elapsed > 0 else 0
                     if not self._safe_stop:
@@ -1399,145 +1683,7 @@ class ProcessThread(QThread):
                     print(f"[THREAD-{self.thread_id}] フレームレストーラー停止中の例外: {e}")
             
             self.is_running = False
-            if self.audio_thread and not self._safe_stop:
-                self.audio_thread.stop_playback()
             print(f"[THREAD-{self.thread_id}] スレッド終了処理完了")
-
-
-class AudioThread(QThread):
-    def __init__(self, vlc_instance, initial_volume=100, is_muted=False):
-        super().__init__()
-        self.vlc_instance = vlc_instance
-        self.player = self.vlc_instance.media_player_new()
-        self._stop_flag = False
-        self._is_paused = True
-        self.volume = initial_volume
-        self.user_muted = is_muted
-        self.internal_muted = False
-        
-        self.player.audio_set_volume(self.volume)
-        self._update_vlc_mute_state()
-        
-        print(f"[AUDIO] AudioThread初期化: Volume={self.volume}, Mute={self.user_muted}")
-
-    def run(self):
-        while not self._stop_flag:
-            time.sleep(0.1)
-
-    def _update_vlc_mute_state(self):
-        if not VLC_AVAILABLE:
-            return
-        should_be_muted = self.user_muted or self.internal_muted
-        self.player.audio_set_mute(should_be_muted)
-
-    def set_internal_mute(self, is_muted):
-        if not VLC_AVAILABLE:
-            return
-        self.internal_muted = is_muted
-        self._update_vlc_mute_state()
-
-    def start_playback(self, video_path, start_sec=0.0):
-        if not VLC_AVAILABLE or self._stop_flag:
-            return
-            
-        try:
-            media = self.vlc_instance.media_new(video_path)
-            self.player.set_media(media)
-            
-            msec = int(start_sec * 1000)
-            
-            self.set_internal_mute(True)
-            self.player.play()
-            time.sleep(0.01)
-            
-            if start_sec > 0.0:
-                for _ in range(10):
-                    if self.player.get_state() in (vlc.State.Playing, vlc.State.Paused):
-                        break
-                    time.sleep(0.05)
-                
-                if self.player.is_seekable():
-                    self.player.set_time(msec)
-
-            self.set_internal_mute(False)
-            self._is_paused = False
-        except Exception as e:
-            print(f"[AUDIO] 再生開始エラー: {e}")
-        
-    def stop_playback(self):
-        if not VLC_AVAILABLE:
-            return
-            
-        try:
-            self.player.stop()
-            self._is_paused = True
-        except Exception as e:
-            print(f"[AUDIO] 再生停止エラー: {e}")
-
-    def pause_audio(self):
-        if not VLC_AVAILABLE or self._is_paused or self._stop_flag:
-            return
-            
-        try:
-            self.player.pause()
-            self._is_paused = True
-        except Exception as e:
-            print(f"[AUDIO] 一時停止エラー: {e}")
-
-    def resume_audio(self, start_sec):
-        if not VLC_AVAILABLE or not self._is_paused or self._stop_flag:
-            return
-            
-        try:
-            self.seek_to_time(start_sec)
-            self.player.play()
-            self._is_paused = False
-            self._update_vlc_mute_state()
-        except Exception as e:
-            print(f"[AUDIO] 再生再開エラー: {e}")
-
-    def seek_to_time(self, seconds):
-        if not VLC_AVAILABLE or self._stop_flag:
-            return
-            
-        try:
-            msec = int(seconds * 1000)
-            
-            self.set_internal_mute(True)
-            
-            for _ in range(10):
-                if self.player.get_state() in (vlc.State.Playing, vlc.State.Paused):
-                    break
-                time.sleep(0.1)
-
-            if self.player.is_seekable():
-                self.player.set_time(msec)
-            
-            self.set_internal_mute(False)
-        except Exception as e:
-            print(f"[AUDIO] シークエラー: {e}")
-
-    def set_volume(self, volume):
-        if not VLC_AVAILABLE:
-            return
-        self.volume = max(0, min(100, volume))
-        self.player.audio_set_volume(self.volume)
-
-    def toggle_mute(self, is_muted):
-        if not VLC_AVAILABLE:
-            return
-        self.user_muted = is_muted
-        self._update_vlc_mute_state()
-
-    def safe_stop(self):
-        """安全な停止"""
-        print("[AUDIO] 安全停止開始")
-        self._stop_flag = True
-        self.stop_playback()
-        if not self.wait(1000):  # 1秒待機
-            self.terminate()
-            self.wait(500)
-        print("[AUDIO] 安全停止完了")
 
 
 class LadaFinalPlayer(QMainWindow):
@@ -1569,6 +1715,11 @@ class LadaFinalPlayer(QMainWindow):
         # process_threadをNoneで明示的に初期化
         self.process_thread = None
         
+        # 範囲再生用変数 - 仕様通りに初期化
+        self.range_start = None  # RS
+        self.range_end = None    # RE
+        self.range_mode = False  # 範囲指定再生モード
+        
         # VLCの初期化
         self.vlc_instance = vlc.Instance('--no-video') if VLC_AVAILABLE else None
         self.audio_thread = None
@@ -1588,7 +1739,7 @@ class LadaFinalPlayer(QMainWindow):
         self.stats_timer.start(1000)
         
         self.init_ui()
-        print("[MAIN] プレイヤー初期化完了 - デッドロック対策版")
+        print("[MAIN] プレイヤー初期化完了 - 音声安定化版")
 
     def load_settings(self):
         if CONFIG_FILE.exists():
@@ -1623,12 +1774,15 @@ class LadaFinalPlayer(QMainWindow):
             print(f"[MAIN] 設定保存失敗: {e}")
 
     def init_ui(self):
-        self.setWindowTitle("LADA REALTIME PLAYER V1.0 - Smart Cache - デッドロック対策版")
+        self.setWindowTitle("LADA REALTIME PLAYER V1.1")
         self.setGeometry(100, 100, 1200, 850)
         
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
+        
+        # ウィンドウサイズ変更を有効化（元の設定を維持）
+        self.setMinimumSize(800, 600)
         
         self.filename_label = QLabel("")
         self.filename_label.setStyleSheet("""
@@ -1653,12 +1807,33 @@ class LadaFinalPlayer(QMainWindow):
         self.video_widget.seek_requested.connect(self.seek_to_frame)
         self.video_widget.toggle_mute_signal.connect(self.toggle_mute_shortcut)
         self.video_widget.toggle_ai_processing_signal.connect(self.toggle_ai_processing)
+        
+        # 新しいシグナル接続
+        self.video_widget.set_range_start_signal.connect(self.set_range_start)
+        self.video_widget.set_range_end_signal.connect(self.set_range_end)
+        self.video_widget.reset_range_signal.connect(self.reset_range)
+        self.video_widget.seek_to_start_signal.connect(self.seek_to_start)
+        self.video_widget.seek_to_end_signal.connect(self.seek_to_end)
+        self.video_widget.seek_to_percentage_signal.connect(self.seek_to_percentage)
+        self.video_widget.toggle_range_mode_signal.connect(self.toggle_range_mode)
+        
         self.video_layout.addWidget(self.video_widget)
         layout.addLayout(self.video_layout)
         
         self.progress_bar = QProgressBar()
         self.progress_bar.setTextVisible(False)
         self.progress_bar.mousePressEvent = self.seek_click
+        # 通常画面の進捗バー高さを約5mmに設定（元の色を維持）
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                background-color: rgba(40, 40, 40, 200);
+                border: none;
+                height: 19px;  /* 約5mm */
+            }
+            QProgressBar::chunk {
+                background-color: #00ff00;
+            }
+        """)
         layout.addWidget(self.progress_bar)
         
         time_audio_layout = QHBoxLayout()
@@ -1748,9 +1923,10 @@ class LadaFinalPlayer(QMainWindow):
         info.setReadOnly(True)
         info.setMaximumHeight(100)
         info.setText("""
-V1.0 Smart Cache Edition - デッドロック対策版 : 
+V1.1 20251009 : 
 操作: F=フルスクリーントグル | Space=再生/停止 | M=ミュートトグル | X=AI処理トグル | 進捗バークリックでシーク
-デッドロック対策: タイムアウト付きミューテックス、安全なスレッド停止
+新機能: S=先頭/範囲開始 | E=末尾/範囲終了 | 1-9=10%-90%移動 | Ctrl+S=範囲開始点 | Ctrl+E=範囲終了点 | Ctrl+R=範囲リセット | Ctrl+P=範囲再生モードトグル
+制限事項: 音声不安定、メモリリーク、範囲機能不具合
 """)
         layout.addWidget(info)
         
@@ -1796,6 +1972,218 @@ V1.0 Smart Cache Edition - デッドロック対策版 :
         
         self.shortcut_ai_toggle = QShortcut(QKeySequence('X'), self)
         self.shortcut_ai_toggle.activated.connect(self.toggle_ai_processing)
+        
+        # 新しいショートカット
+        self.shortcut_s = QShortcut(QKeySequence('S'), self)
+        self.shortcut_s.activated.connect(self.seek_to_start)
+        
+        self.shortcut_e = QShortcut(QKeySequence('E'), self)
+        self.shortcut_e.activated.connect(self.seek_to_end)
+        
+        # 数字キーショートカット (1-9)
+        for i in range(1, 10):
+            shortcut = QShortcut(QKeySequence(str(i)), self)
+            shortcut.activated.connect(lambda checked=False, percent=i: self.seek_to_percentage(percent))
+        
+        # 範囲再生ショートカット
+        self.shortcut_ctrl_s = QShortcut(QKeySequence('Ctrl+S'), self)
+        self.shortcut_ctrl_s.activated.connect(self.set_range_start)
+        
+        self.shortcut_ctrl_e = QShortcut(QKeySequence('Ctrl+E'), self)
+        self.shortcut_ctrl_e.activated.connect(self.set_range_end)
+        
+        self.shortcut_ctrl_r = QShortcut(QKeySequence('Ctrl+R'), self)
+        self.shortcut_ctrl_r.activated.connect(self.reset_range)
+        
+        self.shortcut_ctrl_p = QShortcut(QKeySequence('Ctrl+P'), self)
+        self.shortcut_ctrl_p.activated.connect(self.toggle_range_mode)
+
+    def seek_to_start(self):
+        """Sキー：先頭または範囲開始点へ移動"""
+        if self.range_mode and self.range_start is not None:
+            target_frame = self.range_start
+        else:
+            target_frame = 0
+        
+        self.fast_seek_to_frame(target_frame)
+
+    def seek_to_end(self):
+        """Eキー：末尾または範囲終了点へ移動"""
+        if self.range_mode and self.range_end is not None:
+            target_frame = self.range_end
+        else:
+            target_frame = self.total_frames - 1 if self.total_frames > 0 else 0
+        
+        self.fast_seek_to_frame(target_frame)
+
+    def seek_to_percentage(self, percent):
+        """1-9キー：指定パーセント位置へ移動"""
+        if self.total_frames > 0:
+            target_frame = int((percent * 0.1) * self.total_frames)
+            self.fast_seek_to_frame(target_frame)
+
+    def set_range_start(self):
+        """Ctrl+S：範囲再生開始点設定 - 仕様通りに実装"""
+        if self.total_frames == 0:
+            return
+            
+        # CCをRSに設定する
+        self.range_start = self.current_frame
+        print(f"[RANGE] 開始点設定: {self.range_start}")
+        
+        # もし、RS>REならEEをREに設定
+        if self.range_end is not None and self.range_start > self.range_end:
+            self.range_end = self.total_frames - 1
+            print(f"[RANGE] RS>REのためREをEEに設定: {self.range_end}")
+        
+        # また、RE未設定ならEEをREに設定
+        if self.range_end is None:
+            self.range_end = self.total_frames - 1
+            print(f"[RANGE] RE未設定のためEEをREに設定: {self.range_end}")
+        
+        self.update_progress_bar_marks()
+        self.update_mode_label()
+
+    def set_range_end(self):
+        """Ctrl+E：範囲再生終了点設定 - 仕様通りに実装"""
+        if self.total_frames == 0:
+            return
+            
+        # CCをREに設定する
+        self.range_end = self.current_frame
+        print(f"[RANGE] 終了点設定: {self.range_end}")
+        
+        # もし、RE<RSならSSをRSに設定する
+        if self.range_start is not None and self.range_end < self.range_start:
+            self.range_start = 0
+            print(f"[RANGE] RE<RSのためSSをRSに設定: {self.range_start}")
+        
+        # また、RS未設定ならSSをRSに設定する
+        if self.range_start is None:
+            self.range_start = 0
+            print(f"[RANGE] RS未設定のためSSをRSに設定: {self.range_start}")
+        
+        self.update_progress_bar_marks()
+        self.update_mode_label()
+
+    def reset_range(self):
+        """Ctrl+R：範囲再生リセット"""
+        self.range_start = None
+        self.range_end = None
+        self.range_mode = False
+        self.update_progress_bar_marks()
+        self.update_mode_label()
+        print("[RANGE] 範囲再生リセット")
+
+    def toggle_range_mode(self):
+        """Ctrl+P：範囲再生モードトグル"""
+        if self.range_start is not None and self.range_end is not None:
+            self.range_mode = not self.range_mode
+            self.update_progress_bar_marks()
+            self.update_mode_label()
+            print(f"[RANGE] 範囲再生モード: {'ON' if self.range_mode else 'OFF'}")
+        else:
+            print("[RANGE] 範囲が設定されていません。先にCtrl+SとCtrl+Eで範囲を設定してください。")
+
+    def update_mode_label(self):
+        """モード表示を更新"""
+        if self.range_mode:
+            if self.range_start is not None and self.range_end is not None:
+                # 時間表示に変更
+                start_sec = self.range_start / self.video_fps if self.video_fps > 0 else 0
+                end_sec = self.range_end / self.video_fps if self.video_fps > 0 else 0
+                start_time = self.format_time(start_sec)
+                end_time = self.format_time(end_sec)
+                self.mode_label.setText(f"📊 モード: 🔄 範囲再生中 ({start_time}-{end_time})")
+            else:
+                self.mode_label.setText("📊 モード: 🔄 範囲再生中")
+        else:
+            if self.range_start is not None and self.range_end is not None:
+                # 時間表示に変更
+                start_sec = self.range_start / self.video_fps if self.video_fps > 0 else 0
+                end_sec = self.range_end / self.video_fps if self.video_fps > 0 else 0
+                start_time = self.format_time(start_sec)
+                end_time = self.format_time(end_sec)
+                self.mode_label.setText(f"📊 モード: 🔄 AI処理中 [範囲設定済: {start_time}-{end_time}]")
+            else:
+                self.mode_label.setText("📊 モード: 🔄 AI処理中")
+
+    def update_progress_bar_marks(self):
+        """進捗バーに範囲マークを表示（色を逆に）"""
+        if self.range_start is not None or self.range_end is not None:
+            # ベースのスタイル
+            base_style = """
+                QProgressBar {
+                    background-color: rgba(40, 40, 40, 200);
+                    border: none;
+                    height: 19px;
+                }
+                QProgressBar::chunk {
+            """
+            
+            # 色を逆に：通常モード=青、範囲再生モード=緑
+            if self.range_mode:
+                base_style += "background-color: #00ff00;"  # 範囲再生モード：緑
+            else:
+                base_style += "background-color: #0088ff;"  # 通常モード：青
+            
+            base_style += "}"
+            
+            # 範囲マーカー用の追加スタイル
+            marker_style = ""
+            
+            # 範囲開始マーカー（赤い縦線）
+            if self.range_start is not None and self.total_frames > 0:
+                start_percent = (self.range_start / self.total_frames) * 100
+                marker_style += f"""
+                QProgressBar::chunk {{
+                    border-left: 2px solid red;
+                    margin-left: {start_percent}%;
+                }}
+                """
+            
+            # 範囲終了マーカー（青い縦線）
+            if self.range_end is not None and self.total_frames > 0:
+                end_percent = 100 - (self.range_end / self.total_frames) * 100
+                marker_style += f"""
+                QProgressBar::chunk {{
+                    border-right: 2px solid blue;
+                    margin-right: {end_percent}%;
+                }}
+                """
+            
+            self.progress_bar.setStyleSheet(base_style + marker_style)
+            
+            # フルスクリーン進捗バーも色を逆に更新
+            if self.range_mode:
+                self.video_widget.set_progress_bar_color('#00ff00')  # 範囲再生モード：緑
+            else:
+                if not self.is_paused:
+                    self.video_widget.set_progress_bar_color('#0088ff')  # 通常モード：青
+                else:
+                    self.video_widget.set_progress_bar_color('red')
+        else:
+            # 範囲指定がない場合はデフォルトスタイル（青）
+            default_style = """
+                QProgressBar {
+                    background-color: rgba(40, 40, 40, 200);
+                    border: none;
+                    height: 19px;
+                }
+                QProgressBar::chunk {
+                    background-color: #0088ff;
+                }
+            """
+            self.progress_bar.setStyleSheet(default_style)
+
+    def check_range_loop(self):
+        """範囲再生のループチェック"""
+        if (self.range_mode and 
+            self.range_start is not None and 
+            self.range_end is not None and 
+            self.current_frame >= self.range_end):
+            # 範囲終了点に達したら開始点に戻る
+            self.fast_seek_to_frame(self.range_start)
 
     def toggle_mute_shortcut(self):
         if self.audio_thread:
@@ -1850,6 +2238,10 @@ V1.0 Smart Cache Edition - デッドロック対策版 :
             self.save_audio_settings()
 
     def toggle_ai_processing(self):
+        """AI処理切り替え - フレーム位置同期版"""
+        # 現在のフレーム位置を保存
+        current_frame = self.current_frame
+        
         self.ai_processing_enabled = not self.ai_processing_enabled
         
         if self.ai_processing_enabled:
@@ -1862,15 +2254,21 @@ V1.0 Smart Cache Edition - デッドロック対策版 :
             self.mode_label.setText("📊 モード: 🎥 原画再生")
         
         if self.current_video:
-            current_frame = self.current_frame
+            # 現在のフレーム位置から再開（同期を確保）
             self.safe_restart_playback(current_frame)
 
     def safe_restart_playback(self, start_frame):
-        """安全な再生再開"""
+        """安全な再生再開 - フレーム位置保証版"""
         print(f"[MAIN] 安全な再生再開: フレーム{start_frame}")
         
         # 安全な停止
         self.safe_stop()
+        
+        # フレーム位置を現在の値に設定（範囲内に収める）
+        if self.range_mode and self.range_start is not None and self.range_end is not None:
+            start_frame = max(self.range_start, min(start_frame, self.range_end))
+        else:
+            start_frame = max(0, min(start_frame, self.total_frames - 1))
         
         # 即時再開
         self.start_processing_from_frame(start_frame)
@@ -1903,21 +2301,25 @@ V1.0 Smart Cache Edition - デッドロック対策版 :
         return file_ext in video_extensions
 
     def update_stats(self):
-        stats = self.frame_cache.get_stats()
-        self.cache_label.setText(f"💾 キャッシュ: {stats['size_mb']:.1f}MB ({stats['total_frames']}f)")
-        
-        # スマートキャッシュ統計
-        if 'hit_ratio' in stats and 'policy_distribution' in stats:
-            hit_ratio = stats['hit_ratio'] * 100
+        try:
+            stats = self.frame_cache.get_stats()
+            self.cache_label.setText(f"💾 キャッシュ: {stats['size_mb']:.1f}MB ({stats['total_frames']}f)")
             
-            policy_summary = ""
-            total_chunks = sum(stats['policy_distribution'].values())
-            for policy, count in stats['policy_distribution'].items():
-                percentage = (count / total_chunks) * 100 if total_chunks > 0 else 0
-                if percentage >= 5.0:
-                    policy_summary += f"{policy[:2]}:{percentage:.0f}% "
-            
-            self.smart_cache_label.setText(f"🤖 Hit:{hit_ratio:.0f}% {policy_summary.strip()}")
+            # スマートキャッシュ統計
+            if 'hit_ratio' in stats and 'policy_distribution' in stats:
+                hit_ratio = stats['hit_ratio'] * 100
+                
+                policy_summary = ""
+                total_chunks = sum(stats['policy_distribution'].values())
+                for policy, count in stats['policy_distribution'].items():
+                    percentage = (count / total_chunks) * 100 if total_chunks > 0 else 0
+                    if percentage >= 5.0:
+                        policy_summary += f"{policy[:2]}:{percentage:.0f}% "
+                
+                self.smart_cache_label.setText(f"🤖 Hit:{hit_ratio:.0f}% {policy_summary.strip()}")
+        except Exception as e:
+            # 統計更新中のエラーを無視（KeyboardInterruptなど）
+            pass
 
     def format_time(self, seconds):
         h = int(seconds // 3600)
@@ -1933,6 +2335,9 @@ V1.0 Smart Cache Edition - デッドロック対策版 :
             # キャッシュに再生位置を通知
             self.frame_cache.update_playhead(frame_num)
             
+            # 範囲再生ループチェック
+            self.check_range_loop()
+            
             current_sec = frame_num / self.video_fps if self.video_fps > 0 else 0
             total_sec = self.total_frames / self.video_fps if self.video_fps > 0 else 0
             
@@ -1941,13 +2346,32 @@ V1.0 Smart Cache Edition - デッドロック対策版 :
             self.time_label.setText(f"{current_time} / {total_time}")
             
             if is_cached:
-                self.mode_label.setText("📊 モード: 💾 キャッシュ再生")
+                if self.range_mode:
+                    # 時間表示に変更
+                    start_sec = self.range_start / self.video_fps if self.range_start is not None and self.video_fps > 0 else 0
+                    end_sec = self.range_end / self.video_fps if self.range_end is not None and self.video_fps > 0 else 0
+                    start_time = self.format_time(start_sec)
+                    end_time = self.format_time(end_sec)
+                    self.mode_label.setText(f"📊 モード: 💾 範囲再生中 ({start_time}-{end_time})")
+                else:
+                    self.mode_label.setText("📊 モード: 💾 キャッシュ再生")
                 if not self.is_paused:
                     self.video_widget.set_progress_bar_color('yellow')
             else:
-                self.mode_label.setText("📊 モード: 🔄 AI処理中")
+                if self.range_mode:
+                    # 時間表示に変更
+                    start_sec = self.range_start / self.video_fps if self.range_start is not None and self.video_fps > 0 else 0
+                    end_sec = self.range_end / self.video_fps if self.range_end is not None and self.video_fps > 0 else 0
+                    start_time = self.format_time(start_sec)
+                    end_time = self.format_time(end_sec)
+                    self.mode_label.setText(f"📊 モード: 🔄 範囲再生中 ({start_time}-{end_time})")
+                else:
+                    self.mode_label.setText("📊 モード: 🔄 AI処理中")
                 if not self.is_paused:
-                    self.video_widget.set_progress_bar_color('#00ff00')
+                    if self.range_mode:
+                        self.video_widget.set_progress_bar_color('#00ff00')  # 範囲再生モード：緑
+                    else:
+                        self.video_widget.set_progress_bar_color('#0088ff')  # 通常モード：青
 
     def on_progress_update(self, current, total):
         self.current_frame = current
@@ -1964,7 +2388,11 @@ V1.0 Smart Cache Edition - デッドロック対策版 :
         if self.total_frames == 0 or not self.current_video:
             return
         
-        target_frame = max(0, min(self.current_frame + delta, self.total_frames - 1))
+        # 範囲再生モード時は範囲内に制限
+        if self.range_mode and self.range_start is not None and self.range_end is not None:
+            target_frame = max(self.range_start, min(self.current_frame + delta, self.range_end))
+        else:
+            target_frame = max(0, min(self.current_frame + delta, self.total_frames - 1))
         
         # 即時UI更新
         self.current_frame = target_frame
@@ -1986,6 +2414,10 @@ V1.0 Smart Cache Edition - デッドロック対策版 :
         
         self._seeking = True
         
+        # 範囲再生モード時は範囲内に制限
+        if self.range_mode and self.range_start is not None and self.range_end is not None:
+            target_frame = max(self.range_start, min(target_frame, self.range_end))
+        
         # 音声シーク（非ブロッキング）
         if self.audio_thread:
             target_sec = target_frame / self.video_fps if self.video_fps > 0 else 0
@@ -2004,14 +2436,23 @@ V1.0 Smart Cache Edition - デッドロック対策版 :
 
     def seek_to_frame(self, target_frame):
         """互換性のためのシーク処理"""
+        # 範囲再生モード時は範囲内に制限
+        if self.range_mode and self.range_start is not None and self.range_end is not None:
+            target_frame = max(self.range_start, min(target_frame, self.range_end))
+        
         self.fast_seek_to_frame(target_frame)
 
     def closeEvent(self, event):
+        """終了処理 - 順序改善"""
         print("=== 安全な終了処理 ===")
+        
+        # まずメインの再生を停止
         self.safe_stop()
         
-        # 音声スレッドの安全な停止
+        # 音声スレッドの安全な停止（最後に）
         if self.audio_thread:
+            # 少し待ってから音声スレッドを停止
+            time.sleep(0.1)
             self.audio_thread.safe_stop()
         
         # OpenGLリソース解放
@@ -2022,8 +2463,12 @@ V1.0 Smart Cache Edition - デッドロック対策版 :
             except:
                 pass
         
+        # キャッシュクリーンアップ
         self.frame_cache.clear()
+        
+        # 設定保存
         self.save_settings()
+        
         print("=== 終了処理完了 ===")
         event.accept()
 
@@ -2032,6 +2477,11 @@ V1.0 Smart Cache Edition - デッドロック対策版 :
             pos = event.pos().x()
             width = self.progress_bar.width()
             target_frame = int((pos / width) * self.total_frames)
+            
+            # 範囲再生モード時は範囲内に制限
+            if self.range_mode and self.range_start is not None and self.range_end is not None:
+                target_frame = max(self.range_start, min(target_frame, self.range_end))
+            
             self.fast_seek_to_frame(target_frame)
 
     def open_video(self):
@@ -2110,6 +2560,9 @@ V1.0 Smart Cache Edition - デッドロック対策版 :
         self.safe_stop()
         self.frame_cache.clear()
         self.video_widget.clear_frame()
+        
+        # 範囲再生状態をリセット
+        self.reset_range()
         
         self.current_video = path
         
@@ -2224,13 +2677,16 @@ V1.0 Smart Cache Edition - デッドロック対策版 :
         self.is_paused = False
         self.play_pause_btn.setEnabled(True)
         self.play_pause_btn.setText("⏸ 一時停止")
-        self.mode_label.setText("📊 モード: 🔄 AI処理中")
-        self.video_widget.set_progress_bar_color('#00ff00')
+        self.update_mode_label()
+        if self.range_mode:
+            self.video_widget.set_progress_bar_color('#0088ff')
+        else:
+            self.video_widget.set_progress_bar_color('#00ff00')
         
         print(f"[MAIN] AI処理スレッド開始完了: ID{current_id}")
 
     def start_original_playback(self, start_frame):
-        """AI処理無効時の元動画再生"""
+        """AI処理無効時の元動画再生 - フレーム位置同期強化版"""
         print(f"[MAIN] 原画再生開始: フレーム{start_frame}")
         
         # 既存のキャプチャとタイマーを確実にクリーンアップ
@@ -2254,9 +2710,32 @@ V1.0 Smart Cache Edition - デッドロック対策版 :
             self.mode_label.setText("エラー: 動画読み込み失敗")
             return
         
-        # フレーム位置を設定
+        # フレーム位置を正確に設定
         self.original_capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
         self.current_frame = start_frame
+        
+        # 設定した位置が正しいか確認（デバッグ用）
+        actual_pos = self.original_capture.get(cv2.CAP_PROP_POS_FRAMES)
+        print(f"[MAIN] 原画再生: 要求フレーム={start_frame}, 実際の位置={actual_pos}")
+        
+        # 最初のフレームを即時表示
+        ret, first_frame = self.original_capture.read()
+        if ret:
+            self.video_widget.update_frame(first_frame)
+            self.current_frame = start_frame + 1  # 読み込んだのでインクリメント
+        else:
+            # 読み込み失敗時は先頭にリセット
+            print("[MAIN] 最初のフレーム読み込み失敗、先頭にリセット")
+            self.original_capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            self.current_frame = 0
+            ret, first_frame = self.original_capture.read()
+            if ret:
+                self.video_widget.update_frame(first_frame)
+                self.current_frame = 1
+        
+        # UI更新
+        self.progress_bar.setValue(self.current_frame)
+        self.video_widget.update_progress(self.current_frame)
         
         # 新しいタイマーを作成
         self.original_timer = QTimer()
@@ -2269,46 +2748,62 @@ V1.0 Smart Cache Edition - デッドロック対策版 :
         self.is_paused = False
         self.play_pause_btn.setEnabled(True)
         self.play_pause_btn.setText("⏸ 一時停止")
-        self.mode_label.setText("📊 モード: 🎥 原画再生")
-        self.video_widget.set_progress_bar_color('#00ff00')
+        self.update_mode_label()
+        
+        # 進捗バーの色設定
+        if self.range_mode:
+            self.video_widget.set_progress_bar_color('#0088ff')
+        else:
+            self.video_widget.set_progress_bar_color('#00ff00')
         
         # キャッシュに再生位置を通知
-        self.frame_cache.update_playhead(start_frame)
+        self.frame_cache.update_playhead(self.current_frame)
         
-        # 音声再生開始
+        # 音声再生開始 - 正確な位置から
         if self.audio_thread:
-            start_sec = start_frame / self.video_fps if self.video_fps > 0 else 0
+            start_sec = self.current_frame / self.video_fps if self.video_fps > 0 else 0
             self.audio_thread.start_playback(str(self.current_video), start_sec)
         
-        print(f"[MAIN] 原画再生開始完了: フレーム{start_frame}, 間隔{frame_interval}ms")
+        print(f"[MAIN] 原画再生開始完了: フレーム{self.current_frame}, 間隔{frame_interval}ms")
 
     def update_original_frame(self):
+        """原画フレーム更新 - フレーム位置管理強化版"""
         if not hasattr(self, 'original_capture') or not self.original_capture or not self.is_playing or self.is_paused:
             return
         
         ret, frame = self.original_capture.read()
         if ret:
             self.video_widget.update_frame(frame)
-            self.current_frame += 1
+            
+            # 進捗更新
             self.progress_bar.setValue(self.current_frame)
             self.video_widget.update_progress(self.current_frame)
+            
+            # 範囲再生ループチェック
+            self.check_range_loop()
             
             # キャッシュに再生位置を通知
             if self.current_frame % 30 == 0:
                 self.frame_cache.update_playhead(self.current_frame)
             
+            # 時間表示更新
             current_sec = self.current_frame / self.video_fps if self.video_fps > 0 else 0
             total_sec = self.total_frames / self.video_fps if self.video_fps > 0 else 0
             current_time = self.format_time(current_sec)
             total_time = self.format_time(total_sec)
             self.time_label.setText(f"{current_time} / {total_time}")
             
+            # フレームカウンタ更新
+            self.current_frame += 1
+            
+            # 終了チェック
             if self.current_frame >= self.total_frames:
                 self.original_timer.stop()
                 self.is_playing = False
                 self.play_pause_btn.setText("▶ 再生")
                 self.mode_label.setText("📊 モード: 🎥 再生完了")
         else:
+            # 再生終了
             self.original_timer.stop()
             self.is_playing = False
             self.play_pause_btn.setText("▶ 再生")
@@ -2321,8 +2816,11 @@ V1.0 Smart Cache Edition - デッドロック対策版 :
                 self.original_timer.start()
                 self.is_paused = False
                 self.play_pause_btn.setText("⏸ 一時停止")
-                self.mode_label.setText("📊 モード: 🎥 原画再生")
-                self.video_widget.set_progress_bar_color('#00ff00')
+                self.update_mode_label()
+                if self.range_mode:
+                    self.video_widget.set_progress_bar_color('#0088ff')
+                else:
+                    self.video_widget.set_progress_bar_color('#00ff00')
                 
                 if self.audio_thread:
                     start_sec = self.current_frame / self.video_fps if self.video_fps > 0 else 0
@@ -2347,8 +2845,11 @@ V1.0 Smart Cache Edition - デッドロック対策版 :
             self.process_thread.resume()
             self.is_paused = False
             self.play_pause_btn.setText("⏸ 一時停止")
-            self.mode_label.setText("📊 モード: 🔄 AI処理中")
-            self.video_widget.set_progress_bar_color('#00ff00')
+            self.update_mode_label()
+            if self.range_mode:
+                self.video_widget.set_progress_bar_color('#0088ff')
+            else:
+                self.video_widget.set_progress_bar_color('#00ff00')
         else:
             self.process_thread.pause()
             self.is_paused = True
@@ -2357,10 +2858,10 @@ V1.0 Smart Cache Edition - デッドロック対策版 :
             self.video_widget.set_progress_bar_color('red')
 
     def safe_stop(self):
-        """安全な停止 - デッドロック防止"""
+        """安全な停止 - 完全な停止シーケンス"""
         print("[MAIN] 安全停止開始")
         
-        # 状態フラグのみ設定
+        # 状態フラグ設定
         self.is_playing = False
         self.is_paused = False
         
@@ -2369,11 +2870,19 @@ V1.0 Smart Cache Edition - デッドロック対策版 :
             self.original_timer.stop()
         
         if hasattr(self, 'original_capture') and self.original_capture:
-            self.original_capture.release()
+            try:
+                self.original_capture.release()
+            except Exception as e:
+                print(f"[MAIN] 原画キャプチャ解放エラー: {e}")
             self.original_capture = None
         
         # AI処理スレッドの安全な停止
         if hasattr(self, 'process_thread') and self.process_thread:
+            # 音声停止を先に行う
+            if self.audio_thread:
+                self.audio_thread.stop_playback()
+                time.sleep(0.03)
+                
             self.process_thread.safe_stop()
             self.process_thread = None
         
