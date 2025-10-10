@@ -23,7 +23,8 @@
  Ladaインストールフォルダで、  
   
 　`.\python\python.exe -m pip install PyQt6 PyOpenGL PyOpenGL-accelerate python-vlc`  
-　
+  
+  
 以下のファイルを<strong>バックアップ</strong>した後、ここで提供したものを上書きする。  
 
 　`\python\Lib\site-packages\lada\lib\frame_restorer.py`
