@@ -15,7 +15,7 @@ from collections import OrderedDict, deque
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QProgressBar, QTextEdit,
-    QDialog, QSpinBox, QFormLayout, QDialogButtonBox, QSlider, QSizePolicy, QMessageBox
+    QDialog, QSpinBox, QFormLayout, QDialogButtonBox, QSlider, QSizePolicy, QMessageBox, QComboBox 
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QMutex, QMutexLocker, QTimer, QPoint
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
@@ -72,6 +72,23 @@ class SettingsDialog(QDialog):
             "• 16並列: 最高性能（メモリ注意）"
         )
         layout.addRow("並列クリップ処理:", self.parallel_clips_spin)
+        
+        # モザイク検知モデル選択セクション
+        layout.addRow(QLabel("<b>モザイク検知モデル設定</b>"))
+        
+        self.model_combo = QComboBox()
+        self.model_combo.addItem("lada_mosaic_detection_model_v2.pt", "lada_mosaic_detection_model_v2.pt")
+        self.model_combo.addItem("lada_mosaic_detection_model_v3.1_fast.pt", "lada_mosaic_detection_model_v3.1_fast.pt")
+        self.model_combo.addItem("lada_mosaic_restoration_model_generic_v1.2.pth", "lada_mosaic_restoration_model_generic_v1.2.pth")
+        
+        # 現在の設定を選択
+        current_model = self.settings.get('detection_model', 'lada_mosaic_detection_model_v3.1_fast.pt')
+        index = self.model_combo.findData(current_model)
+        if index >= 0:
+            self.model_combo.setCurrentIndex(index)
+            
+        self.model_combo.setToolTip("使用するモザイク検知モデルを選択\n• v2: 基本モデル\n• v3.1_fast: 高速版\n• generic_v1.2: 汎用復元モデル")
+        layout.addRow("検知モデル:", self.model_combo)
         
         # RESTORER専用設定セクション
         layout.addRow(QLabel("<b>RESTORER設定</b>"))
@@ -141,13 +158,13 @@ class SettingsDialog(QDialog):
     def get_settings(self):
         """設定値を取得"""
         return {
+            'detection_model': self.model_combo.currentData(),  # 追加
             'parallel_clips': self.parallel_clips_spin.value(),
             'batch_size': self.batch_size_spin.value(),
             'queue_size_mb': self.queue_size_spin.value(),
             'max_clip_length': self.max_clip_length_spin.value(),
             'cache_size_mb': self.cache_size_spin.value(),
             'chunk_frames': self.chunk_frames_spin.value(),
-            # 既存の設定も保持
             'audio_volume': self.settings.get('audio_volume', 100),
             'audio_muted': self.settings.get('audio_muted', False)
         }
@@ -1474,12 +1491,12 @@ class ProcessThread(QThread):
     progress_updated = pyqtSignal(int, int)
     finished_signal = pyqtSignal()
     
-    def __init__(self, video_path, detection_path, restoration_path, frame_cache, 
+    def __init__(self, video_path, model_dir, detection_model_name, frame_cache, 
                 start_frame, thread_id, settings, audio_thread=None, video_fps=30.0):
         super().__init__()
         self.video_path = Path(video_path)
-        self.detection_path = Path(detection_path)
-        self.restoration_path = Path(restoration_path)
+        self.model_dir = Path(model_dir)
+        self.detection_model_name = detection_model_name  # モデル名を受け取る
         self.frame_cache = frame_cache
         self.start_frame = start_frame
         self.thread_id = thread_id
@@ -1488,7 +1505,7 @@ class ProcessThread(QThread):
         self.batch_size = settings.get('batch_size', 16)
         self.queue_size_mb = settings.get('queue_size_mb', 12288)
         self.max_clip_length = settings.get('max_clip_length', 8)
-        self.parallel_clips = settings.get('parallel_clips', 4)  # デフォルトを4に変更
+        self.parallel_clips = settings.get('parallel_clips', 4)
         
         self.frame_restorer = None
         self.is_running = False
@@ -1506,6 +1523,7 @@ class ProcessThread(QThread):
         self._safe_stop = False
         
         print(f"[THREAD-{thread_id}] プロセススレッド初期化完了")
+        print(f"[THREAD-{thread_id}] 使用モデル: {self.detection_model_name}")
         print(f"[THREAD-{thread_id}] RESTORER設定: batch_size={self.batch_size}, queue_size_mb={self.queue_size_mb}MB")
         print(f"[THREAD-{thread_id}] RESTORER設定: max_clip_length={self.max_clip_length}, parallel_clips={self.parallel_clips}")
 
@@ -1581,6 +1599,7 @@ class ProcessThread(QThread):
     def run(self):
         print(f"[THREAD-{self.thread_id}] スレッド開始")
         print(f"[THREAD-{self.thread_id}] 設定: batch_size={self.batch_size}, parallel_clips={self.parallel_clips}")
+        print(f"[THREAD-{self.thread_id}] 検知モデル: {self.detection_model_name}")
         
         self.is_running = True
         self._stop_flag = False
@@ -1607,12 +1626,28 @@ class ProcessThread(QThread):
                 if not audio_success:
                     print(f"[THREAD-{self.thread_id}] 音声再生開始失敗")
             
+            # モデルファイルのパスを構築
+            detection_path = self.model_dir / self.detection_model_name
+            restoration_path = self.model_dir / "lada_mosaic_restoration_model_generic_v1.2.pth"
+            
+            print(f"[THREAD-{self.thread_id}] 検知モデルパス: {detection_path}")
+            print(f"[THREAD-{self.thread_id}] 復元モデルパス: {restoration_path}")
+            
+            # モデルファイルの存在確認
+            if not detection_path.exists():
+                print(f"[THREAD-{self.thread_id}] エラー: 検知モデルファイルが見つかりません: {detection_path}")
+                return
+            
+            if not restoration_path.exists():
+                print(f"[THREAD-{self.thread_id}] エラー: 復元モデルファイルが見つかりません: {restoration_path}")
+                return
+            
             detection_model, restoration_model, pad_mode = load_models(
                 device="cuda:0",
                 mosaic_restoration_model_name="basicvsrpp-v1.2",
-                mosaic_restoration_model_path=str(self.restoration_path),
+                mosaic_restoration_model_path=str(restoration_path),
                 mosaic_restoration_config_path=None,
-                mosaic_detection_model_path=str(self.detection_path)
+                mosaic_detection_model_path=str(detection_path)
             )
             
             if self._stop_flag or self._safe_stop:
@@ -1895,6 +1930,10 @@ class LadaFinalPlayer(QMainWindow):
         
         self.settings = self.load_settings()
         
+        # デフォルト設定に検知モデルを追加
+        if 'detection_model' not in self.settings:
+            self.settings['detection_model'] = 'lada_mosaic_detection_model_v3.1_fast.pt'
+        
         # スマートキャッシュで初期化（設定からパラメータを取得）
         chunk_frames = self.settings.get('chunk_frames', 150)
         cache_size_mb = self.settings.get('cache_size_mb', 12288)
@@ -2141,6 +2180,7 @@ V1.2 20251010-1 : ちょっとよくなったよバージョン
                     print(f"[MAIN] 設定読み込み: 音量={settings.get('audio_volume')}, ミュート={settings.get('audio_muted')}")
                     # デフォルト設定を追加
                     default_settings = {
+                        'detection_model': 'lada_mosaic_detection_model_v3.1_fast.pt', 
                         'batch_size': 16,
                         'queue_size_mb': 12288,
                         'max_clip_length': 8,
@@ -2160,6 +2200,7 @@ V1.2 20251010-1 : ちょっとよくなったよバージョン
         
         # デフォルト設定
         return {
+            'detection_model': 'lada_mosaic_detection_model_v3.1_fast.pt',
             'batch_size': 16,
             'queue_size_mb': 12288,
             'max_clip_length': 8,
@@ -2888,11 +2929,25 @@ V1.2 20251010-1 : ちょっとよくなったよバージョン
             return
         
         model_dir = LADA_BASE_PATH / "model_weights"
-        detection_path = model_dir / "lada_mosaic_detection_model_v3.1_fast.pt"
-        restoration_path = model_dir / "lada_mosaic_restoration_model_generic_v1.2.pth"
         
-        if not detection_path.exists() or not restoration_path.exists():
-            self.mode_label.setText("エラー: モデルなし")
+        # 設定から選択された検知モデルを使用
+        detection_model_name = self.settings.get('detection_model', 'lada_mosaic_detection_model_v3.1_fast.pt')
+        detection_path = model_dir / detection_model_name
+        restoration_path = model_dir / "lada_mosaic_restoration_model_generic_v1.2.pth"  # 復元モデルは固定
+        
+        print(f"[MAIN] 選択された検知モデル: {detection_model_name}")
+        print(f"[MAIN] 検知モデルパス: {detection_path}")
+        print(f"[MAIN] 復元モデルパス: {restoration_path}")
+        
+        # モデルファイルの存在確認
+        if not detection_path.exists():
+            self.mode_label.setText(f"エラー: 検知モデルなし - {detection_model_name}")
+            print(f"[MAIN] 検知モデルファイルが見つかりません: {detection_path}")
+            return
+        
+        if not restoration_path.exists():
+            self.mode_label.setText("エラー: 復元モデルなし")
+            print(f"[MAIN] 復元モデルファイルが見つかりません: {restoration_path}")
             return
         
         self.thread_counter += 1
@@ -2900,9 +2955,15 @@ V1.2 20251010-1 : ちょっとよくなったよバージョン
         
         # 新しいスレッドを作成
         self.process_thread = ProcessThread(
-            self.current_video, detection_path, restoration_path,
-            self.frame_cache, start_frame, current_id, self.settings,
-            audio_thread=self.audio_thread, video_fps=self.video_fps
+            self.current_video, 
+            model_dir,  # モデルディレクトリを渡す
+            detection_model_name,  # 選択されたモデル名を渡す
+            self.frame_cache, 
+            start_frame, 
+            current_id, 
+            self.settings,
+            audio_thread=self.audio_thread, 
+            video_fps=self.video_fps
         )
         
         # シグナル接続
