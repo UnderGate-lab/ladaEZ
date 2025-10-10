@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LADA REALTIME PLAYER V1.1
+LADA REALTIME PLAYER V1.2
 """
 
 import sys
@@ -10,6 +10,7 @@ import numpy as np
 import time
 import json
 import gc
+import queue 
 from collections import OrderedDict, deque
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -47,72 +48,108 @@ except ImportError as e:
     print(f"✗ VLC: {e} - 音声機能は無効化されます")
 
 
+# rp_pf.py の SettingsDialog クラスを修正
+
 class SettingsDialog(QDialog):
-    """設定ダイアログ"""
-    
     def __init__(self, parent=None, current_settings=None):
         super().__init__(parent)
-        self.setWindowTitle("AI処理設定")
         self.settings = current_settings or {}
         
         layout = QFormLayout(self)
         
+        # 既存の設定項目...
+        
+        # 並列処理設定 - 範囲を拡大
+        self.parallel_clips_spin = QSpinBox()
+        self.parallel_clips_spin.setRange(1, 16)  # 最大値を16に拡大
+        self.parallel_clips_spin.setValue(self.settings.get('parallel_clips', 4))  # デフォルトを4に
+        self.parallel_clips_spin.setSuffix(" clips")
+        self.parallel_clips_spin.setToolTip(
+            "同時に処理するクリップ数\n"
+            "推奨設定:\n"
+            "• 4並列: 標準的な並列処理\n" 
+            "• 8並列: 高性能GPU向け\n"
+            "• 16並列: 最高性能（メモリ注意）"
+        )
+        layout.addRow("並列クリップ処理:", self.parallel_clips_spin)
+        
+        # RESTORER専用設定セクション
+        layout.addRow(QLabel("<b>RESTORER設定</b>"))
+        
+        # バッチサイズ設定
         self.batch_size_spin = QSpinBox()
-        self.batch_size_spin.setRange(4, 64)
+        self.batch_size_spin.setRange(1, 32)
         self.batch_size_spin.setValue(self.settings.get('batch_size', 16))
         self.batch_size_spin.setSuffix(" frames")
+        self.batch_size_spin.setToolTip("一度に処理するフレーム数\n大きいほど高速だがメモリ消費が増加")
         layout.addRow("バッチサイズ:", self.batch_size_spin)
         
+        # キューサイズ設定
         self.queue_size_spin = QSpinBox()
-        self.queue_size_spin.setRange(2048, 32768)
-        self.queue_size_spin.setSingleStep(1024)
+        self.queue_size_spin.setRange(256, 16384)
         self.queue_size_spin.setValue(self.settings.get('queue_size_mb', 12288))
         self.queue_size_spin.setSuffix(" MB")
+        self.queue_size_spin.setToolTip("処理キューのメモリサイズ\n大きいほど安定するがメモリ消費が増加")
         layout.addRow("キューサイズ:", self.queue_size_spin)
         
-        self.clip_length_spin = QSpinBox()
-        self.clip_length_spin.setRange(1, 48)
-        self.clip_length_spin.setValue(self.settings.get('max_clip_length', 8))
-        self.clip_length_spin.setSuffix(" frames")
-        layout.addRow("最大クリップ長:", self.clip_length_spin)
+        # 最大クリップ長設定
+        self.max_clip_length_spin = QSpinBox()
+        self.max_clip_length_spin.setRange(1, 32)
+        self.max_clip_length_spin.setValue(self.settings.get('max_clip_length', 8))
+        self.max_clip_length_spin.setSuffix(" frames")
+        self.max_clip_length_spin.setToolTip("1クリップあたりの最大フレーム数")
+        layout.addRow("最大クリップ長:", self.max_clip_length_spin)
         
+        # キャッシュ設定セクション
+        layout.addRow(QLabel("<b>キャッシュ設定</b>"))
+        
+        # キャッシュサイズ設定
         self.cache_size_spin = QSpinBox()
-        self.cache_size_spin.setRange(1024, 16384)
-        self.cache_size_spin.setSingleStep(512)
+        self.cache_size_spin.setRange(1024, 32768)
         self.cache_size_spin.setValue(self.settings.get('cache_size_mb', 12288))
         self.cache_size_spin.setSuffix(" MB")
+        self.cache_size_spin.setToolTip("フレームキャッシュの最大サイズ")
         layout.addRow("キャッシュサイズ:", self.cache_size_spin)
         
+        # チャンクフレーム数設定
         self.chunk_frames_spin = QSpinBox()
-        self.chunk_frames_spin.setRange(30, 450)  # 1秒〜15秒 (30fps想定)
+        self.chunk_frames_spin.setRange(50, 500)
         self.chunk_frames_spin.setValue(self.settings.get('chunk_frames', 150))
         self.chunk_frames_spin.setSuffix(" frames")
-        self.chunk_frames_spin.setToolTip("チャンクあたりのフレーム数 (推奨: 150 = 5秒@30fps)")
+        self.chunk_frames_spin.setToolTip("1チャンクあたりのフレーム数\n小さいほど細かい管理だがオーバーヘッド増加")
         layout.addRow("チャンクサイズ:", self.chunk_frames_spin)
         
+        # 情報テキストを更新
         info = QLabel(
             "※設定変更後、処理が完全リセットされます\n"
             "※高い値 = 高速だがメモリ消費大\n"
-            "※30FPS達成推奨設定: バッチ16, キュー12GB, クリップ長8"
+            "※推奨設定:\n"
+            "  - 4並列 + 16バッチ: バランス良い設定\n"
+            "  - 8並列 + 32バッチ: 高性能GPU向け\n" 
+            "  - 16並列 + 32バッチ: メモリ豊富な環境向け\n"
+            "※メモリ不足時は自動的に並列数制限"
         )
         info.setStyleSheet("color: #888; font-size: 10px;")
         layout.addRow(info)
         
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | 
-            QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
+        # ボタンボックス
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addRow(button_box)
     
     def get_settings(self):
+        """設定値を取得"""
         return {
+            'parallel_clips': self.parallel_clips_spin.value(),
             'batch_size': self.batch_size_spin.value(),
             'queue_size_mb': self.queue_size_spin.value(),
-            'max_clip_length': self.clip_length_spin.value(),
+            'max_clip_length': self.max_clip_length_spin.value(),
             'cache_size_mb': self.cache_size_spin.value(),
-            'chunk_frames': self.chunk_frames_spin.value()
+            'chunk_frames': self.chunk_frames_spin.value(),
+            # 既存の設定も保持
+            'audio_volume': self.settings.get('audio_volume', 100),
+            'audio_muted': self.settings.get('audio_muted', False)
         }
 
 
@@ -147,8 +184,10 @@ class SmartChunkBasedCache:
         self.consecutive_fast_frames = 0
         self.slow_frame_threshold = 3      # モザイク検出の連続フレーム数
         self.fast_frame_threshold = 5      # モザイク解除の連続フレーム数
-        self.mosaic_threshold_ms = 80.0    # モザイク判定閾値
-        self.fast_threshold_ms = 40.0      # 高速判定閾値
+        #self.mosaic_threshold_ms = 80.0    # モザイク判定閾値
+        #self.fast_threshold_ms = 40.0      # 高速判定閾値
+        self.mosaic_threshold_ms = 40.0    # モザイク判定閾値
+        self.fast_threshold_ms = 20.0      # 高速判定閾値
         self.last_mosaic_change_time = 0   # 最後のモザイク状態変化時間
         
         # インテリジェント削除用データ
@@ -1106,21 +1145,49 @@ class OptimizedFrameRestorer:
     def __init__(self, device, video_file, preserve_relative_scale, max_clip_length,
                  mosaic_restoration_model_name, mosaic_detection_model, 
                  mosaic_restoration_model, preferred_pad_mode,
-                 batch_size=16, queue_size_mb=12288, mosaic_detection=False):
-        from lada.lib.frame_restorer import FrameRestorer
-        import queue
+                 batch_size=16, queue_size_mb=12288, mosaic_detection=False,
+                 parallel_clips=2):
         
-        self._parent = FrameRestorer(
-            device=device, video_file=video_file,
-            preserve_relative_scale=preserve_relative_scale,
-            max_clip_length=max_clip_length,
-            mosaic_restoration_model_name=mosaic_restoration_model_name,
-            mosaic_detection_model=mosaic_detection_model,
-            mosaic_restoration_model=mosaic_restoration_model,
-            preferred_pad_mode=preferred_pad_mode,
-            mosaic_detection=mosaic_detection
-        )
+        try:
+            # 最適化されたFrameRestorerを使用
+            from lada.lib.frame_restorer import OptimizedFrameRestorer as OFR
+            
+            self._parent = OFR(
+                device=device, 
+                video_file=video_file,
+                preserve_relative_scale=preserve_relative_scale,
+                max_clip_length=max_clip_length,
+                mosaic_restoration_model_name=mosaic_restoration_model_name,
+                mosaic_detection_model=mosaic_detection_model,
+                mosaic_restoration_model=mosaic_restoration_model,
+                preferred_pad_mode=preferred_pad_mode,
+                mosaic_detection=mosaic_detection,
+                batch_size=batch_size,
+                parallel_clips=parallel_clips
+            )
+            
+            print(f"[OPTIMIZE] 最適化FrameRestorerの作成成功 - 並列数: {parallel_clips}")
+            
+        except Exception as e:
+            print(f"[OPTIMIZE] 最適化FrameRestorerの作成に失敗: {e}")
+            print("[OPTIMIZE] 通常版のFrameRestorerを使用します")
+            
+            # フォールバック: 通常のFrameRestorerを使用
+            from lada.lib.frame_restorer import FrameRestorer
+            
+            self._parent = FrameRestorer(
+                device=device, 
+                video_file=video_file,
+                preserve_relative_scale=preserve_relative_scale,
+                max_clip_length=max_clip_length,
+                mosaic_restoration_model_name=mosaic_restoration_model_name,
+                mosaic_detection_model=mosaic_detection_model,
+                mosaic_restoration_model=mosaic_restoration_model,
+                preferred_pad_mode=preferred_pad_mode,
+                mosaic_detection=mosaic_detection
+            )
         
+        # 既存のキューサイズ設定
         w = self._parent.video_meta_data.video_width
         h = self._parent.video_meta_data.video_height
         
@@ -1139,7 +1206,6 @@ class OptimizedFrameRestorer:
         
         print(f"[OPTIMIZE] Queue: {max_frames}f, {max_clips}c ({queue_size_mb}MB)")
         print(f"[OPTIMIZE] Batch size: {self._parent.batch_size}")
-
 
     def start(self, start_ns=0):
         return self._parent.start(start_ns)
@@ -1408,7 +1474,8 @@ class ProcessThread(QThread):
     progress_updated = pyqtSignal(int, int)
     finished_signal = pyqtSignal()
     
-    def __init__(self, video_path, detection_path, restoration_path, frame_cache, start_frame, thread_id, settings, audio_thread=None, video_fps=30.0):
+    def __init__(self, video_path, detection_path, restoration_path, frame_cache, 
+                start_frame, thread_id, settings, audio_thread=None, video_fps=30.0):
         super().__init__()
         self.video_path = Path(video_path)
         self.detection_path = Path(detection_path)
@@ -1417,32 +1484,32 @@ class ProcessThread(QThread):
         self.start_frame = start_frame
         self.thread_id = thread_id
         
+        # 設定からRESTORERパラメータを取得
         self.batch_size = settings.get('batch_size', 16)
         self.queue_size_mb = settings.get('queue_size_mb', 12288)
         self.max_clip_length = settings.get('max_clip_length', 8)
+        self.parallel_clips = settings.get('parallel_clips', 4)  # デフォルトを4に変更
         
         self.frame_restorer = None
         self.is_running = False
         self._stop_flag = False
         self.is_paused = False
-        self.pause_mutex = QMutex()  # 通常のミューテックス
+        self.pause_mutex = QMutex()
         
         self.audio_thread = audio_thread
         self.video_fps = video_fps
         self.total_frames = 0
         
-        # 高速シーク用の変数
         self._seek_requested = False
         self._seek_target = 0
-        self._seek_mutex = QMutex()  # 通常のミューテックス
-        
-        # デッドロック防止用
+        self._seek_mutex = QMutex()
         self._safe_stop = False
         
         print(f"[THREAD-{thread_id}] プロセススレッド初期化完了")
+        print(f"[THREAD-{thread_id}] RESTORER設定: batch_size={self.batch_size}, queue_size_mb={self.queue_size_mb}MB")
+        print(f"[THREAD-{thread_id}] RESTORER設定: max_clip_length={self.max_clip_length}, parallel_clips={self.parallel_clips}")
 
     def request_seek(self, target_frame):
-        """高速シークリクエスト - デッドロック対策"""
         if not self._seek_mutex.tryLock(10):
             print(f"[THREAD-{self.thread_id}] シークリクエスト: ミューテックス取得失敗")
             return False
@@ -1456,7 +1523,6 @@ class ProcessThread(QThread):
             self._seek_mutex.unlock()
 
     def pause(self):
-        """高速一時停止 - デッドロック対策"""
         if not self.pause_mutex.tryLock(10):
             print(f"[THREAD-{self.thread_id}] 一時停止: ミューテックス取得失敗")
             return
@@ -1470,7 +1536,6 @@ class ProcessThread(QThread):
             self.pause_mutex.unlock()
 
     def resume(self):
-        """高速再開 - デッドロック対策"""
         if not self.pause_mutex.tryLock(10):
             print(f"[THREAD-{self.thread_id}] 再開: ミューテックス取得失敗")
             return
@@ -1485,39 +1550,37 @@ class ProcessThread(QThread):
             self.pause_mutex.unlock()
 
     def safe_stop(self):
-        """安全な停止 - 音声スレッド連携改善"""
         print(f"[THREAD-{self.thread_id}] 安全停止開始")
         self._safe_stop = True
         self._stop_flag = True
         self.is_running = False
         self.is_paused = False
         
-        # フレームレストーラーの停止（例外を無視）
         if self.frame_restorer:
             try:
                 self.frame_restorer.stop()
             except Exception as e:
                 print(f"[THREAD-{self.thread_id}] フレームレストーラー停止中の例外: {e}")
         
-        # 音声スレッドの安全な停止（連携改善）
         if self.audio_thread:
             try:
-                # 音声スレッドに停止を通知
                 self.audio_thread.stop_playback()
-                time.sleep(0.05)  # 音声停止の完了待機
+                time.sleep(0.05)
             except Exception as e:
                 print(f"[THREAD-{self.thread_id}] 音声停止中の例外: {e}")
         
-        # スレッド終了待機（タイムアウト付き）
-        if not self.wait(1000):  # 1秒待機
+        if not self.wait(1000):
             print(f"[THREAD-{self.thread_id}] スレッド終了待機タイムアウト、強制終了")
             self.terminate()
             self.wait(500)
         
         print(f"[THREAD-{self.thread_id}] 安全停止完了")
 
+    # rp_pf.py の ProcessThread クラスの run メソッドを完全修正
+
     def run(self):
         print(f"[THREAD-{self.thread_id}] スレッド開始")
+        print(f"[THREAD-{self.thread_id}] 設定: batch_size={self.batch_size}, parallel_clips={self.parallel_clips}")
         
         self.is_running = True
         self._stop_flag = False
@@ -1537,7 +1600,7 @@ class ProcessThread(QThread):
             if self._stop_flag or self._safe_stop:
                 return
             
-            # 音声再生開始（スレッド開始時）
+            # 音声再生開始
             if self.audio_thread and not self._safe_stop:
                 start_sec = self.start_frame / self.video_fps if self.video_fps > 0 else 0
                 audio_success = self.audio_thread.start_playback(str(self.video_path), start_sec)
@@ -1555,21 +1618,45 @@ class ProcessThread(QThread):
             if self._stop_flag or self._safe_stop:
                 return
             
-            self.frame_restorer = OptimizedFrameRestorer(
-                device="cuda:0",
-                video_file=self.video_path,
-                preserve_relative_scale=True,
-                max_clip_length=self.max_clip_length,
-                mosaic_restoration_model_name="basicvsrpp-v1.2",
-                mosaic_detection_model=detection_model,
-                mosaic_restoration_model=restoration_model,
-                preferred_pad_mode=pad_mode,
-                batch_size=self.batch_size,
-                queue_size_mb=self.queue_size_mb,
-                mosaic_detection=False
-            )
+            # 最適化されたFrameRestorerを作成
+            try:
+                print(f"[THREAD-{self.thread_id}] 最適化FrameRestorerを作成中...")
+                self.frame_restorer = OptimizedFrameRestorer(
+                    device="cuda:0",
+                    video_file=self.video_path,
+                    preserve_relative_scale=True,
+                    max_clip_length=self.max_clip_length,  # 設定から取得
+                    mosaic_restoration_model_name="basicvsrpp-v1.2",
+                    mosaic_detection_model=detection_model,
+                    mosaic_restoration_model=restoration_model,
+                    preferred_pad_mode=pad_mode,
+                    batch_size=self.batch_size,  # 設定から取得
+                    queue_size_mb=self.queue_size_mb,  # 設定から取得
+                    mosaic_detection=False,
+                    parallel_clips=self.parallel_clips  # 設定から取得
+                )
+                print(f"[THREAD-{self.thread_id}] 最適化FrameRestorerの作成成功")
+                
+            except Exception as e:
+                print(f"[THREAD-{self.thread_id}] 最適化FrameRestorerの作成に失敗: {e}")
+                print(f"[THREAD-{self.thread_id}] 通常のFrameRestorerを使用します")
+                
+                from lada.lib.frame_restorer import FrameRestorer
+                self.frame_restorer = FrameRestorer(
+                    device="cuda:0",
+                    video_file=self.video_path,
+                    preserve_relative_scale=True,
+                    max_clip_length=self.max_clip_length,
+                    mosaic_restoration_model_name="basicvsrpp-v1.2",
+                    mosaic_detection_model=detection_model,
+                    mosaic_restoration_model=restoration_model,
+                    preferred_pad_mode=pad_mode,
+                    mosaic_detection=False
+                )
             
+            # フレームレストーラーの開始 - これが抜けていました
             start_ns = int((self.start_frame / self.video_fps) * 1_000_000_000)
+            print(f"[THREAD-{self.thread_id}] フレームレストーラー開始: フレーム{self.start_frame}, {start_ns}ns")
             self.frame_restorer.start(start_ns=start_ns)
             
             # メイン処理ループ
@@ -1593,6 +1680,8 @@ class ProcessThread(QThread):
             
             consecutive_cached_frames = 0
             max_consecutive_cached = 30
+            
+            print(f"[THREAD-{self.thread_id}] メイン処理ループ開始")
             
             while self.is_running and not self._stop_flag and not self._safe_stop and frame_count < self.total_frames:
                 # 安全停止チェック
@@ -1630,7 +1719,7 @@ class ProcessThread(QThread):
                             # キャッシュに再生位置を通知
                             self.frame_cache.update_playhead(frame_count)
                             
-                            # 音声シーク（非ブロッキング）
+                            # 音声シーク
                             if self.audio_thread and not self._safe_stop:
                                 target_sec = frame_count / self.video_fps
                                 QTimer.singleShot(0, lambda: self.audio_thread.seek_to_time(target_sec))
@@ -1689,7 +1778,7 @@ class ProcessThread(QThread):
                 if self._stop_flag or self._safe_stop:
                     break
                 
-                # フレーム処理（既存のロジック）
+                # フレーム処理
                 cached_frame = self.frame_cache.get(frame_count)
                 
                 if cached_frame is not None:
@@ -1763,7 +1852,7 @@ class ProcessThread(QThread):
                 if not self._safe_stop:
                     self.frame_ready.emit(final_frame, frame_count, is_cached)
                 
-                # 音声同期（間隔を長くして負荷軽減）
+                # 音声同期
                 if self.audio_thread and frame_count % (int(self.video_fps) * 30) == 0 and not self._safe_stop:
                     current_sec = frame_count / self.video_fps
                     QTimer.singleShot(0, lambda: self.audio_thread.seek_to_time(current_sec))
@@ -1772,7 +1861,7 @@ class ProcessThread(QThread):
                 if not self._safe_stop:
                     self.progress_updated.emit(frame_count, self.total_frames)
                 
-                # FPS更新（間隔を長くして負荷軽減）
+                # FPS更新
                 if frame_count % 30 == 0:
                     elapsed = time.time() - start_time - total_pause_duration
                     actual_fps = (frame_count - self.start_frame) / elapsed if elapsed > 0 else 0
@@ -1798,7 +1887,6 @@ class ProcessThread(QThread):
             self.is_running = False
             print(f"[THREAD-{self.thread_id}] スレッド終了処理完了")
 
-
 class LadaFinalPlayer(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1807,7 +1895,7 @@ class LadaFinalPlayer(QMainWindow):
         
         self.settings = self.load_settings()
         
-        # スマートキャッシュで初期化
+        # スマートキャッシュで初期化（設定からパラメータを取得）
         chunk_frames = self.settings.get('chunk_frames', 150)
         cache_size_mb = self.settings.get('cache_size_mb', 12288)
         self.frame_cache = SmartChunkBasedCache(
@@ -1852,49 +1940,18 @@ class LadaFinalPlayer(QMainWindow):
         self.stats_timer.start(1000)
         
         self.init_ui()
-        print("[MAIN] プレイヤー初期化完了 - 音声安定化版")
-
-    def load_settings(self):
-        if CONFIG_FILE.exists():
-            try:
-                with open(CONFIG_FILE, 'r') as f:
-                    settings = json.load(f)
-                    print(f"[MAIN] 設定読み込み: 音量={settings.get('audio_volume')}, ミュート={settings.get('audio_muted')}")
-                    return settings
-            except:
-                pass
-        
-        return {
-            'batch_size': 16,
-            'queue_size_mb': 12288,
-            'max_clip_length': 8,
-            'cache_size_mb': 12288,
-            'chunk_frames': 150,
-            'audio_volume': 100, 
-            'audio_muted': False
-        }
-
-    def save_settings(self):
-        if self.audio_thread:
-            if not self.audio_thread.user_muted:
-                self.settings['audio_volume'] = self.audio_thread.volume
-            self.settings['audio_muted'] = self.audio_thread.user_muted
-            
-        try:
-            with open(CONFIG_FILE, 'w') as f:
-                json.dump(self.settings, f, indent=2)
-        except Exception as e:
-            print(f"[MAIN] 設定保存失敗: {e}")
+        print("[MAIN] プレイヤー初期化完了 - RESTORER設定対応版")
 
     def init_ui(self):
-        self.setWindowTitle("LADA REALTIME PLAYER V1.1")
+        """UIの初期化"""
+        self.setWindowTitle("LADA REALTIME PLAYER V1.2")
         self.setGeometry(100, 100, 1200, 850)
         
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
         
-        # ウィンドウサイズ変更を有効化（元の設定を維持）
+        # ウィンドウサイズ変更を有効化
         self.setMinimumSize(800, 600)
         
         self.filename_label = QLabel("")
@@ -1936,12 +1993,11 @@ class LadaFinalPlayer(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setTextVisible(False)
         self.progress_bar.mousePressEvent = self.seek_click
-        # 通常画面の進捗バー高さを約5mmに設定（元の色を維持）
         self.progress_bar.setStyleSheet("""
             QProgressBar {
                 background-color: rgba(40, 40, 40, 200);
                 border: none;
-                height: 19px;  /* 約5mm */
+                height: 19px;
             }
             QProgressBar::chunk {
                 background-color: #00ff00;
@@ -2036,10 +2092,10 @@ class LadaFinalPlayer(QMainWindow):
         info.setReadOnly(True)
         info.setMaximumHeight(100)
         info.setText("""
-V1.1 20251009-3 : 
+V1.2 20251010-1 : ちょっとよくなったよバージョン
 操作: F=フルスクリーントグル | Space=再生/停止 | M=ミュートトグル | X=AI処理トグル | 進捗バークリックでシーク
 新機能: S=先頭/範囲開始 | E=末尾/範囲終了 | 1-9=10%-90%移動 | Ctrl+S=範囲開始点 | Ctrl+E=範囲終了点 | Ctrl+R=範囲リセット | Ctrl+P=範囲再生モードトグル
-制限事項: 音声不安定、範囲機能不具合
+制限事項: チューニング不足（ポテンシャルはまだまだあります）、音声不安定、範囲機能不具合
 """)
         layout.addWidget(info)
         
@@ -2055,7 +2111,67 @@ V1.1 20251009-3 :
             self.audio_thread.toggle_mute(self.settings.get('audio_muted', False))
             self.mute_btn.setText("🔇" if self.settings.get('audio_muted', False) else "🔊")
 
+    def update_stats(self):
+        """キャッシュ統計を更新"""
+        try:
+            stats = self.frame_cache.get_stats()
+            self.cache_label.setText(f"💾 キャッシュ: {stats['size_mb']:.1f}MB ({stats['total_frames']}f)")
+            
+            # スマートキャッシュ統計
+            if 'hit_ratio' in stats and 'policy_distribution' in stats:
+                hit_ratio = stats['hit_ratio'] * 100
+                
+                policy_summary = ""
+                total_chunks = sum(stats['policy_distribution'].values())
+                for policy, count in stats['policy_distribution'].items():
+                    percentage = (count / total_chunks) * 100 if total_chunks > 0 else 0
+                    if percentage >= 5.0:
+                        policy_summary += f"{policy[:2]}:{percentage:.0f}% "
+                
+                self.smart_cache_label.setText(f"🤖 Hit:{hit_ratio:.0f}% {policy_summary.strip()}")
+        except Exception as e:
+            pass
+
+    def load_settings(self):
+        """設定の読み込み - 修正版"""
+        if CONFIG_FILE.exists():
+            try:
+                with open(CONFIG_FILE, 'r') as f:
+                    settings = json.load(f)
+                    print(f"[MAIN] 設定読み込み: 音量={settings.get('audio_volume')}, ミュート={settings.get('audio_muted')}")
+                    # デフォルト設定を追加
+                    default_settings = {
+                        'batch_size': 16,
+                        'queue_size_mb': 12288,
+                        'max_clip_length': 8,
+                        'cache_size_mb': 12288,
+                        'chunk_frames': 150,
+                        'audio_volume': 100, 
+                        'audio_muted': False,
+                        'parallel_clips': 4
+                    }
+                    # 既存の設定とデフォルトをマージ
+                    for key, value in default_settings.items():
+                        if key not in settings:
+                            settings[key] = value
+                    return settings
+            except Exception as e:
+                print(f"[MAIN] 設定読み込みエラー: {e}")
+        
+        # デフォルト設定
+        return {
+            'batch_size': 16,
+            'queue_size_mb': 12288,
+            'max_clip_length': 8,
+            'cache_size_mb': 12288,
+            'chunk_frames': 150,
+            'audio_volume': 100, 
+            'audio_muted': False,
+            'parallel_clips': 4
+        }
+
     def setup_shortcuts(self):
+        """ショートカットの設定"""
         self.shortcut_fullscreen = QShortcut(QKeySequence('F'), self)
         self.shortcut_fullscreen.activated.connect(self.toggle_fullscreen_shortcut)
         
@@ -2615,19 +2731,19 @@ V1.1 20251009-3 :
             
             cache_related_settings = [
                 'batch_size', 'queue_size_mb', 'max_clip_length',
-                'cache_size_mb', 'chunk_frames'
+                'cache_size_mb', 'chunk_frames', 'parallel_clips'  # parallel_clipsを追加
             ]
             
             for key in cache_related_settings:
                 if new_settings.get(key) != self.settings.get(key):
                     needs_restart = True
-                    if key == 'chunk_frames':
+                    if key in ['chunk_frames', 'cache_size_mb']:
                         needs_cache_rebuild = True
                     break
             
             if needs_restart:
                 self.settings.update(new_settings)
-                self.save_settings()
+                self.save_settings()  # ここで保存
 
                 print("[MAIN] 設定変更 - 安全なリセット実行")
                 self.safe_stop()
@@ -2656,7 +2772,24 @@ V1.1 20251009-3 :
                 msg.exec()
             else:
                 self.settings.update(new_settings)
-                self.save_settings()
+                self.save_settings()  # ここでも保存
+                
+    def save_settings(self):
+        """設定を保存"""
+        # 音声設定を更新
+        if self.audio_thread:
+            if not self.audio_thread.user_muted:
+                self.settings['audio_volume'] = self.audio_thread.volume
+            self.settings['audio_muted'] = self.audio_thread.user_muted
+        
+        # RESTORER設定を保存
+        try:
+            with open(CONFIG_FILE, 'w') as f:
+                json.dump(self.settings, f, indent=2)
+            print(f"[MAIN] 設定を保存: 音量={self.settings.get('audio_volume')}, ミュート={self.settings.get('audio_muted')}")
+            print(f"[MAIN] RESTORER設定: batch_size={self.settings.get('batch_size')}, parallel_clips={self.settings.get('parallel_clips')}")
+        except Exception as e:
+            print(f"[MAIN] 設定保存失敗: {e}")
 
     def toggle_fullscreen_shortcut(self):
         self.video_widget.toggle_fullscreen()
