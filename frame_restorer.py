@@ -3,8 +3,8 @@ import queue
 import textwrap
 import threading
 import time
-from typing import Optional
-from collections import deque
+from typing import Optional, Dict, Deque
+from collections import deque, OrderedDict
 import concurrent.futures
 
 import cv2
@@ -34,9 +34,177 @@ def load_models(device, mosaic_restoration_model_name, mosaic_restoration_model_
         pad_mode = 'zero'
     else:
         raise NotImplementedError()
-    # setting classes=[0] will consider only for class id = 0 as detections (nsfw mosaics) therefore filtering out sfw mosaics (heads, faces)
     mosaic_detection_model = MosaicDetectionModel(mosaic_detection_model_path, device, classes=[0], conf=0.2)
     return mosaic_detection_model, mosaic_restoration_model, pad_mode
+
+
+class OrderedClipBuffer:
+    """順序保証付きクリップバッファ"""
+    
+    def __init__(self, max_buffer_size=50):
+        self.buffer: Dict[int, any] = OrderedDict()
+        self.next_expected_frame = 0
+        self.max_buffer_size = max_buffer_size
+        self.mutex = threading.Lock()
+        self.ready_event = threading.Event()
+        self.eof_marker = False
+        
+    def put(self, clip):
+        """クリップを順序付きで格納"""
+        with self.mutex:
+            if clip is None:
+                self.eof_marker = True
+                self.ready_event.set()
+                return
+                
+            frame_start = clip.frame_start
+            self.buffer[frame_start] = clip
+            
+            if len(self.buffer) > self.max_buffer_size:
+                oldest_frame = min(self.buffer.keys())
+                if oldest_frame < self.next_expected_frame:
+                    del self.buffer[oldest_frame]
+            
+            self.ready_event.set()
+    
+    def get_next_in_order(self, timeout=None):
+        """次の順序のクリップを取得"""
+        start_time = time.time()
+        
+        while True:
+            with self.mutex:
+                if self.eof_marker and not self.buffer:
+                    return None
+                    
+                if self.next_expected_frame in self.buffer:
+                    clip = self.buffer.pop(self.next_expected_frame)
+                    self.next_expected_frame = clip.frame_start + len(clip.data)
+                    return clip
+            
+            if timeout and (time.time() - start_time) > timeout:
+                return None
+            
+            self.ready_event.wait(timeout=0.01)
+            self.ready_event.clear()
+    
+    def set_next_expected(self, frame_num):
+        """期待するフレーム番号を設定"""
+        with self.mutex:
+            self.next_expected_frame = frame_num
+            self.buffer = OrderedDict({
+                k: v for k, v in self.buffer.items() 
+                if k >= frame_num
+            })
+            self.eof_marker = False
+    
+    def clear(self):
+        """バッファクリア"""
+        with self.mutex:
+            self.buffer.clear()
+            self.next_expected_frame = 0
+            self.eof_marker = False
+
+
+class AdaptiveParallelOptimizer:
+    """適応的並列処理最適化システム"""
+    
+    def __init__(self, initial_parallel=4, min_parallel=2, max_parallel=16):
+        self.current_parallel = initial_parallel
+        self.min_parallel = min_parallel
+        self.max_parallel = max_parallel
+        
+        self.metrics_history = deque(maxlen=100)
+        self.last_adjustment_time = time.time()
+        self.adjustment_interval = 10.0
+        
+        self.total_clips_processed = 0
+        self.total_sync_errors = 0
+        
+        self.mutex = threading.Lock()
+        
+    def record_clip_processing(self, processing_time: float, had_sync_error: bool = False):
+        """クリップ処理の記録"""
+        with self.mutex:
+            self.total_clips_processed += 1
+            if had_sync_error:
+                self.total_sync_errors += 1
+            
+            self.metrics_history.append({
+                'time': time.time(),
+                'processing_time': processing_time,
+                'sync_error': had_sync_error
+            })
+    
+    def should_adjust_parallelism(self) -> bool:
+        """並列数調整が必要か判定"""
+        with self.mutex:
+            current_time = time.time()
+            
+            if current_time - self.last_adjustment_time < self.adjustment_interval:
+                return False
+            
+            if len(self.metrics_history) < 20:
+                return False
+            
+            return True
+    
+    def calculate_optimal_parallelism(self) -> Optional[int]:
+        """最適な並列数を計算"""
+        with self.mutex:
+            if len(self.metrics_history) < 20:
+                return None
+            
+            recent_metrics = list(self.metrics_history)[-50:]
+            
+            avg_time = sum(m['processing_time'] for m in recent_metrics) / len(recent_metrics)
+            error_rate = sum(1 for m in recent_metrics if m['sync_error']) / len(recent_metrics)
+            
+            new_parallel = self.current_parallel
+            
+            if error_rate > 0.1:
+                new_parallel = max(self.min_parallel, self.current_parallel - 2)
+                print(f"[ADAPTIVE] エラー率高: {error_rate:.1%} → 並列数削減 {self.current_parallel}→{new_parallel}")
+                
+            elif error_rate < 0.02 and avg_time < 0.5:
+                if self.current_parallel < self.max_parallel:
+                    new_parallel = min(self.max_parallel, self.current_parallel + 2)
+                    print(f"[ADAPTIVE] 性能良好 → 並列数増加 {self.current_parallel}→{new_parallel}")
+            
+            elif avg_time > 1.0:
+                if self.current_parallel < self.max_parallel and error_rate < 0.05:
+                    new_parallel = min(self.max_parallel, self.current_parallel + 1)
+                    print(f"[ADAPTIVE] 処理遅延 → 並列数増加 {self.current_parallel}→{new_parallel}")
+            
+            self.last_adjustment_time = time.time()
+            
+            if new_parallel != self.current_parallel:
+                self.current_parallel = new_parallel
+                return new_parallel
+            
+            return None
+    
+    def get_stats(self) -> dict:
+        """統計情報取得"""
+        with self.mutex:
+            if not self.metrics_history:
+                return {
+                    'current_parallel': self.current_parallel,
+                    'total_processed': self.total_clips_processed,
+                    'error_rate': 0.0,
+                    'avg_processing_time': 0.0
+                }
+            
+            recent = list(self.metrics_history)[-50:]
+            
+            return {
+                'current_parallel': self.current_parallel,
+                'total_processed': self.total_clips_processed,
+                'total_errors': self.total_sync_errors,
+                'error_rate': self.total_sync_errors / max(self.total_clips_processed, 1),
+                'recent_error_rate': sum(1 for m in recent if m['sync_error']) / len(recent),
+                'avg_processing_time': sum(m['processing_time'] for m in recent) / len(recent),
+                'metrics_count': len(self.metrics_history)
+            }
 
 
 class FrameRestorer:
@@ -57,22 +225,18 @@ class FrameRestorer:
         self.eof = False
         self.stop_requested = False
 
-        # limit queue size to approx 512MB
         self.frame_restoration_queue = queue.Queue()
         max_frames_in_frame_restoration_queue = (512 * 1024 * 1024) // (self.video_meta_data.video_width * self.video_meta_data.video_height * 3)
         self.frame_restoration_queue = queue.Queue(maxsize=max_frames_in_frame_restoration_queue)
 
-        # limit queue size to approx 512MB
-        max_clips_in_mosaic_clips_queue = max(1, (512 * 1024 * 1024) // (self.max_clip_length * 256 * 256 * 4)) # 4 = 3 color channels + mask
+        max_clips_in_mosaic_clips_queue = max(1, (512 * 1024 * 1024) // (self.max_clip_length * 256 * 256 * 4))
         logger.debug(f"Set queue size of queue mosaic_clip_queue to {max_clips_in_mosaic_clips_queue}")
         self.mosaic_clip_queue = queue.Queue(maxsize=max_clips_in_mosaic_clips_queue)
 
-        # limit queue size to approx 512MB
-        max_clips_in_restored_clips_queue = max(1, (512 * 1024 * 1024) // (self.max_clip_length * 256 * 256 * 4)) # 4 = 3 color channels + mask
+        max_clips_in_restored_clips_queue = max(1, (512 * 1024 * 1024) // (self.max_clip_length * 256 * 256 * 4))
         logger.debug(f"Set queue size of queue restored_clip_queue to {max_clips_in_restored_clips_queue}")
         self.restored_clip_queue = queue.Queue(maxsize=max_clips_in_restored_clips_queue)
 
-        # no queue size limit needed, elements are tiny
         self.frame_detection_queue = queue.Queue()
 
         self.mosaic_detector = MosaicDetector(self.mosaic_detection_model, self.video_meta_data.video_file,
@@ -129,28 +293,21 @@ class FrameRestorer:
 
         self.mosaic_detector.stop()
 
-        # unblock consumer
         threading_utils.put_closing_queue_marker(self.mosaic_clip_queue, "mosaic_clip_queue")
-        # unblock producer
         threading_utils.empty_out_queue(self.restored_clip_queue, "restored_clip_queue")
-        # wait until thread stopped
         if self.clip_restoration_thread:
             self.clip_restoration_thread.join()
             logger.debug("clip restoration worker: stopped")
         self.clip_restoration_thread = None
 
-        # unblock consumer
         threading_utils.put_closing_queue_marker(self.frame_detection_queue, "frame_detection_queue")
         threading_utils.put_closing_queue_marker(self.restored_clip_queue, "restored_clip_queue")
-        # unblock producer
         threading_utils.empty_out_queue(self.frame_restoration_queue, "frame_restoration_queue")
-        # wait until thread stopped
         if self.frame_restoration_thread:
             self.frame_restoration_thread.join()
             logger.debug("frame restoration worker: stopped")
         self.frame_restoration_thread = None
 
-        # garbage collection
         threading_utils.empty_out_queue(self.mosaic_clip_queue, "mosaic_clip_queue")
         threading_utils.empty_out_queue(self.restored_clip_queue, "restored_clip_queue")
         threading_utils.empty_out_queue(self.frame_detection_queue, "frame_detection_queue")
@@ -185,7 +342,6 @@ class FrameRestorer:
                 frame_feeder_queue/wait-time-put: {self.mosaic_detector.queue_stats["frame_feeder_queue_wait_time_put"]:.0f}
                 frame_feeder_queue/max-qsize: {self.mosaic_detector.queue_stats["frame_feeder_queue_max_size"]}/{self.mosaic_detector.frame_feeder_queue.maxsize}"""))
 
-
     def _restore_clip_frames(self, images):
         if self.mosaic_restoration_model_name.startswith("deepmosaics"):
             from lada.deepmosaics.inference import restore_video_frames
@@ -199,10 +355,6 @@ class FrameRestorer:
         return restored_clip_images
 
     def _restore_frame(self, frame, frame_num, restored_clips):
-        """
-        Takes mosaic frame and restored clips and replaces mosaic regions in frame with restored content from the clips starting at the same frame number as mosaic frame.
-        Pops starting frame from each restored clip in the process if they actually start at the same frame number as frame.
-        """
         for buffered_clip in [c for c in restored_clips if c.frame_start == frame_num]:
             clip_img, clip_mask, orig_clip_box, orig_crop_shape, pad_after_resize = buffered_clip.pop()
             clip_img = image_utils.unpad_image(clip_img, pad_after_resize)
@@ -215,10 +367,6 @@ class FrameRestorer:
             frame[t:b + 1, l:r + 1, :] = blended_img
 
     def _restore_clip(self, clip):
-        """
-        Restores each contained from of the mosaic clip. If self.mosaic_detection is True will instead draw mosaic detection
-        boundaries on each frame.
-        """
         if self.mosaic_detection:
             restored_clip_images = visualization_utils.draw_mosaic_detections(clip)
         else:
@@ -324,8 +472,6 @@ class FrameRestorer:
                 else:
                     mosaic_detected, frame, frame_pts = _frame_result
                 if mosaic_detected:
-                    # As we don't know how many clips starting with the current frame we'll read and buffer restored clips until we receive a clip
-                    # that starts after the current frame. This makes sure that we've gather all restored clips necessary to restore the current frame.
                     while clips_remaining and not self._contains_at_least_one_clip_starting_after_frame_num(frame_num, clip_buffer):
                         clips_remaining = self._read_next_clip(frame_num, clip_buffer)
 
@@ -352,9 +498,6 @@ class FrameRestorer:
         return self
 
     def __next__(self) -> tuple[np.ndarray, int] | None:
-        """
-        returns None if being called while FrameRestorer is being stopped
-        """
         if self.eof and self.frame_restoration_queue.empty():
             raise StopIteration
         else:
@@ -371,6 +514,7 @@ class FrameRestorer:
     def get_frame_restoration_queue(self):
         return self.frame_restoration_queue
 
+
 class MemoryMonitor:
     """メモリ使用量を監視するクラス"""
     
@@ -379,13 +523,11 @@ class MemoryMonitor:
         self.monitoring = False
         
     def start_monitoring(self):
-        """メモリ監視を開始"""
         self.monitoring = True
         self.peak_memory_usage = 0
         print("[MEMORY-MONITOR] メモリ監視を開始")
     
     def check_memory_usage(self):
-        """現在のメモリ使用量をチェック"""
         if not self.monitoring:
             return 0, 0
             
@@ -397,10 +539,8 @@ class MemoryMonitor:
             memory_info = process.memory_info()
             current_memory_mb = memory_info.rss / (1024 * 1024)
             
-            # ピーク使用量を更新
             self.peak_memory_usage = max(self.peak_memory_usage, current_memory_mb)
             
-            # GPUメモリもチェック
             gpu_memory_mb = 0
             if torch.cuda.is_available():
                 gpu_memory_mb = torch.cuda.memory_allocated() / (1024 * 1024)
@@ -411,73 +551,58 @@ class MemoryMonitor:
             return 0, 0
     
     def stop_monitoring(self):
-        """メモリ監視を停止して結果を表示"""
-        self.monitoring = False
-        print(f"[MEMORY-MONITOR] ピークメモリ使用量: {self.peak_memory_usage:.1f}MB")
-
-
-# frame_restorer.py の最後に追加
-
-class MemoryMonitor:
-    """メモリ使用量を監視するクラス"""
-    
-    def __init__(self):
-        self.peak_memory_usage = 0
-        self.monitoring = False
-        
-    def start_monitoring(self):
-        """メモリ監視を開始"""
-        self.monitoring = True
-        self.peak_memory_usage = 0
-        print("[MEMORY-MONITOR] メモリ監視を開始")
-    
-    def check_memory_usage(self):
-        """現在のメモリ使用量をチェック"""
-        if not self.monitoring:
-            return 0, 0
-            
-        try:
-            import psutil
-            import torch
-            
-            process = psutil.Process()
-            memory_info = process.memory_info()
-            current_memory_mb = memory_info.rss / (1024 * 1024)
-            
-            # ピーク使用量を更新
-            self.peak_memory_usage = max(self.peak_memory_usage, current_memory_mb)
-            
-            # GPUメモリもチェック
-            gpu_memory_mb = 0
-            if torch.cuda.is_available():
-                gpu_memory_mb = torch.cuda.memory_allocated() / (1024 * 1024)
-            
-            return current_memory_mb, gpu_memory_mb
-        except Exception as e:
-            print(f"[MEMORY-MONITOR] エラー: {e}")
-            return 0, 0
-    
-    def stop_monitoring(self):
-        """メモリ監視を停止して結果を表示"""
         self.monitoring = False
         print(f"[MEMORY-MONITOR] ピークメモリ使用量: {self.peak_memory_usage:.1f}MB")
 
 
 class OptimizedFrameRestorer(FrameRestorer):
-    """既存のFrameRestorerを拡張した最適化版 - 並列処理対応"""
+    """既存のFrameRestorerを拡張した最適化版 - 順序保証・適応的並列処理対応"""
     
-    def __init__(self, *args, batch_size=4, parallel_clips=4, **kwargs):
-        # 親クラスの初期化
+    def __init__(self, *args, batch_size=4, parallel_clips=4, 
+                 enable_ordered_processing=False, enable_adaptive_parallel=False, **kwargs):
+        """
+        Args:
+            enable_ordered_processing (bool): 順序保証システムを有効化 (デフォルト: True)
+                - True: モザイク漏れを完全防止（推奨）
+                - False: 従来の高速だが同期ずれリスクあり
+            enable_adaptive_parallel (bool): 適応的並列数調整を有効化 (デフォルト: True)
+                - True: エラー率に応じて並列数を自動調整
+                - False: 固定並列数で動作
+        """
         super().__init__(*args, **kwargs)
         
-        # メモリ監視の初期化
         self.memory_monitor = MemoryMonitor()
         
-        # 最適な並列数を計算
         self.parallel_clips = self._calculate_optimal_parallel_clips(parallel_clips)
         self.batch_size = batch_size
         self.restoration_executor = None
         self.processing_times = deque(maxlen=50)
+        
+        # 機能フラグ
+        self.enable_ordered_processing = enable_ordered_processing
+        self.enable_adaptive_parallel = enable_adaptive_parallel
+        
+        # 順序保証バッファ（有効時のみ）
+        if self.enable_ordered_processing:
+            self.ordered_clip_buffer = OrderedClipBuffer(max_buffer_size=50)
+            self.pending_clips: Deque[int] = deque()
+            self.pending_mutex = threading.Lock()
+            print(f"[OPTIMIZE] 順序保証システム: 有効")
+        else:
+            self.ordered_clip_buffer = None
+            print(f"[OPTIMIZE] 順序保証システム: 無効 (従来方式)")
+        
+        # 適応的最適化システム（有効時のみ）
+        if self.enable_adaptive_parallel:
+            self.adaptive_optimizer = AdaptiveParallelOptimizer(
+                initial_parallel=self.parallel_clips,
+                min_parallel=2,
+                max_parallel=16
+            )
+            print(f"[OPTIMIZE] 適応的並列調整: 有効")
+        else:
+            self.adaptive_optimizer = None
+            print(f"[OPTIMIZE] 適応的並列調整: 無効 (固定{self.parallel_clips}並列)")
         
         print(f"[OPTIMIZE-RESTORER] 初期化完了: batch_size={batch_size}, parallel_clips={self.parallel_clips}")
     
@@ -487,35 +612,31 @@ class OptimizedFrameRestorer(FrameRestorer):
             import psutil
             import torch
             
-            # システムメモリをチェック
             system_memory = psutil.virtual_memory()
             available_memory_gb = system_memory.available / (1024 ** 3)
             total_memory_gb = system_memory.total / (1024 ** 3)
             
-            # GPUメモリをチェック（利用可能な場合）
             gpu_memory_gb = 0
             if torch.cuda.is_available():
                 gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
             
             print(f"[MEMORY-INFO] システムメモリ: {total_memory_gb:.1f}GB (利用可能: {available_memory_gb:.1f}GB), GPUメモリ: {gpu_memory_gb:.1f}GB")
             
-            # メモリに基づく最大並列数を計算
-            max_parallel_by_memory = 4  # デフォルト
+            max_parallel_by_memory = 4
             
             if available_memory_gb >= 32 and gpu_memory_gb >= 16:
-                max_parallel_by_memory = 16  # 高メモリ環境
+                max_parallel_by_memory = 16
             elif available_memory_gb >= 16 and gpu_memory_gb >= 8:
-                max_parallel_by_memory = 8   # 中メモリ環境
+                max_parallel_by_memory = 8
             elif available_memory_gb >= 8:
-                max_parallel_by_memory = 4   # 標準環境
+                max_parallel_by_memory = 4
             else:
-                max_parallel_by_memory = 2   # 低メモリ環境
+                max_parallel_by_memory = 2
             
-            # 要求値とメモリ制限の小さい方を採用
             optimal_parallel = min(requested_parallel_clips, max_parallel_by_memory)
             
             if optimal_parallel != requested_parallel_clips:
-                print(f"[MEMORY-ADJUST] 並列数を{requested_parallel_clips}→{optimal_parallel}に調整（メモリ制限）")
+                print(f"[MEMORY-ADJUST] 並列数を{requested_parallel_clips}→{optimal_parallel}に調整(メモリ制限)")
             else:
                 print(f"[MEMORY-OK] 要求された並列数{requested_parallel_clips}を採用")
             
@@ -529,14 +650,19 @@ class OptimizedFrameRestorer(FrameRestorer):
         """メモリ監視を開始して親クラスのstartを呼び出し"""
         print(f"[OPTIMIZE-RESTORER] 開始: start_ns={start_ns}")
         self.memory_monitor.start_monitoring()
+        
+        # 順序バッファの初期化（有効時のみ）
+        if self.enable_ordered_processing and self.ordered_clip_buffer:
+            start_frame = video_utils.offset_ns_to_frame_num(start_ns, self.video_meta_data.video_fps_exact)
+            self.ordered_clip_buffer.set_next_expected(start_frame)
+        
         return super().start(start_ns)
     
     def _clip_restoration_worker(self):
-        """メモリ使用量を監視しながら並列処理を実行"""
+        """順序保証付き並列クリップ復元ワーカー"""
         logger.debug("optimized clip restoration worker: started")
         print(f"[PARALLEL] 並列クリップ復元ワーカー開始: workers={self.parallel_clips}")
         
-        # スレッドプールの初期化
         self.restoration_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=self.parallel_clips,
             thread_name_prefix='clip_restore_'
@@ -556,7 +682,7 @@ class OptimizedFrameRestorer(FrameRestorer):
                     print(f"[MEMORY-STATUS] システム: {memory_mb:.1f}MB, GPU: {gpu_memory_mb:.1f}MB, 並列数: {self.parallel_clips}")
                     last_memory_check = current_time
                 
-                # クリップを取得（親クラスと同じロジック）
+                # クリップを取得
                 s = time.time()
                 try:
                     clip = self.mosaic_clip_queue.get(timeout=0.1)
@@ -568,14 +694,16 @@ class OptimizedFrameRestorer(FrameRestorer):
                             self.clip_restoration_thread_should_be_running = False
                         break
                     
-                    #print(f"[PARALLEL] クリップ取得: フレーム{clip.frame_start}")
+                    # 処理中リストに追加（順序保証有効時のみ）
+                    if self.enable_ordered_processing:
+                        with self.pending_mutex:
+                            self.pending_clips.append(clip.frame_start)
                     
                     # 並列処理を実行
                     future = self.restoration_executor.submit(self._restore_single_clip, clip)
                     future_to_clip[future] = clip
                     
                 except queue.Empty:
-                    # キューが空の場合は継続
                     continue
                 
                 # 完了した処理の収集
@@ -586,17 +714,23 @@ class OptimizedFrameRestorer(FrameRestorer):
                             clip = future.result()
                             processed_clips += 1
                             
-                            # 結果キューに投入（親クラスと同じロジック）
-                            self.queue_stats["restored_clip_queue_max_size"] = max(
-                                self.restored_clip_queue.qsize() + 1, 
-                                self.queue_stats["restored_clip_queue_max_size"]
-                            )
-                            
-                            s = time.time()
-                            self.restored_clip_queue.put(clip)
-                            self.queue_stats["restored_clip_queue_wait_time_put"] += time.time() - s
-                            
-                            #print(f"[PARALLEL] クリップ処理完了: フレーム{clip.frame_start} (合計{processed_clips})")
+                            # 順序保証バッファまたは通常キューに投入
+                            if self.enable_ordered_processing and self.ordered_clip_buffer:
+                                self.ordered_clip_buffer.put(clip)
+                                
+                                # 処理中リストから削除
+                                with self.pending_mutex:
+                                    if clip.frame_start in self.pending_clips:
+                                        self.pending_clips.remove(clip.frame_start)
+                            else:
+                                # 従来方式（順序保証なし）
+                                self.queue_stats["restored_clip_queue_max_size"] = max(
+                                    self.restored_clip_queue.qsize()+1, 
+                                    self.queue_stats["restored_clip_queue_max_size"]
+                                )
+                                s = time.time()
+                                self.restored_clip_queue.put(clip)
+                                self.queue_stats["restored_clip_queue_wait_time_put"] += time.time() - s
                             
                         except Exception as e:
                             logger.error(f"Clip restoration error: {e}")
@@ -633,42 +767,74 @@ class OptimizedFrameRestorer(FrameRestorer):
             print(f"[PARALLEL] 並列クリップ復元ワーカー終了: 合計{processed_clips}クリップ処理")
         
         if eof:
-            try:
-                self.restored_clip_queue.put(None)
-            except:
-                pass
+            if self.enable_ordered_processing and self.ordered_clip_buffer:
+                try:
+                    self.ordered_clip_buffer.put(None)
+                except:
+                    pass
+            else:
+                try:
+                    self.restored_clip_queue.put(None)
+                except:
+                    pass
             logger.debug("optimized clip restoration worker: stopped itself, EOF")
     
     def _read_next_clip(self, current_frame_num, clip_buffer) -> bool:
-        """安全なクリップ読み込み - アサーションエラーを防止"""
-        try:
-            s = time.time()
-            # タイムアウト付きでクリップを取得
-            clip = self.restored_clip_queue.get(timeout=0.5)
-            self.queue_stats["restored_clip_queue_wait_time_get"] += time.time() - s
-            
-            if self.stop_requested:
-                logger.debug("frame restoration worker: restored_clip_queue consumer unblocked")
-                return False
-            
-            if clip is None:
-                return False
-            
-            # アサーションの代わりに警告ログと安全な処理
-            if clip.frame_start < current_frame_num:
-                print(f"[SYNC-WARNING] クリップ同期ずれ: クリップ開始{clip.frame_start} < 現在フレーム{current_frame_num}")
-                # 古いクリップは破棄して次のクリップを取得
+        """順序保証付きまたは通常のクリップ読み込み"""
+        
+        # 順序保証システム有効時
+        if self.enable_ordered_processing and self.ordered_clip_buffer:
+            try:
+                clip = self.ordered_clip_buffer.get_next_in_order(timeout=1.0)
+                
+                if self.stop_requested:
+                    logger.debug("frame restoration worker: ordered clip buffer consumer unblocked")
+                    return False
+                
+                if clip is None:
+                    with self.pending_mutex:
+                        if len(self.pending_clips) > 0:
+                            return True
+                        else:
+                            return False
+                
+                if clip.frame_start < current_frame_num:
+                    print(f"[SYNC-RECOVERY] 古いクリップを破棄: clip={clip.frame_start}, current={current_frame_num}")
+                    return True
+                
+                clip_buffer.append(clip)
                 return True
-            
-            clip_buffer.append(clip)
-            return True
-            
-        except queue.Empty:
-            # キューが空の場合は継続
-            return True
-        except Exception as e:
-            print(f"[SYNC-ERROR] クリップ読み込みエラー: {e}")
-            return False
+                
+            except Exception as e:
+                print(f"[SYNC-ERROR] クリップ読み込みエラー: {e}")
+                return False
+        
+        # 従来方式（順序保証なし）
+        else:
+            try:
+                s = time.time()
+                clip = self.restored_clip_queue.get(timeout=0.5)
+                self.queue_stats["restored_clip_queue_wait_time_get"] += time.time() - s
+                
+                if self.stop_requested:
+                    logger.debug("frame restoration worker: restored_clip_queue consumer unblocked")
+                    return False
+                
+                if clip is None:
+                    return False
+                
+                # 従来方式では警告のみ
+                if clip.frame_start < current_frame_num:
+                    print(f"[SYNC-WARNING] クリップ同期ずれ: クリップ開始{clip.frame_start} < 現在フレーム{current_frame_num}")
+                
+                clip_buffer.append(clip)
+                return True
+                
+            except queue.Empty:
+                return True
+            except Exception as e:
+                print(f"[SYNC-ERROR] クリップ読み込みエラー: {e}")
+                return False
     
     def _frame_restoration_worker(self):
         """フレーム復元ワーカー - 同期問題を修正"""
@@ -726,20 +892,55 @@ class OptimizedFrameRestorer(FrameRestorer):
         print("[MAIN-WORKER] 最適化フレーム復元ワーカー終了")
 
     def _restore_single_clip(self, clip):
-        """単一クリップの復元処理"""
+        """単一クリップの復元処理 - 適応的最適化対応"""
         start_time = time.time()
         thread_name = threading.current_thread().name
-        #print(f"[CLIP-THREAD] {thread_name}: クリップ処理開始 フレーム{clip.frame_start}")
+        had_error = False
         
-        # 親クラスのメソッドを呼び出し
-        self._restore_clip(clip)
-        
-        processing_time = time.time() - start_time
-        self.processing_times.append(processing_time)
-        
-        #print(f"[CLIP-THREAD] {thread_name}: クリップ処理完了 フレーム{clip.frame_start} ({processing_time:.2f}秒)")
+        try:
+            # 親クラスのメソッドを呼び出し
+            self._restore_clip(clip)
+        except Exception as e:
+            had_error = True
+            raise
+        finally:
+            processing_time = time.time() - start_time
+            self.processing_times.append(processing_time)
+            
+            # 適応的最適化が有効な場合のみ記録
+            if self.enable_adaptive_parallel and self.adaptive_optimizer:
+                self.adaptive_optimizer.record_clip_processing(
+                    processing_time, 
+                    had_sync_error=had_error
+                )
+                
+                # 調整チェック
+                if self.adaptive_optimizer.should_adjust_parallelism():
+                    new_parallel = self.adaptive_optimizer.calculate_optimal_parallelism()
+                    if new_parallel:
+                        self._adjust_parallelism(new_parallel)
         
         return clip
+    
+    def _adjust_parallelism(self, new_parallel: int):
+        """動的に並列数を調整"""
+        if self.restoration_executor:
+            # 既存のエグゼキュータを安全に置き換え
+            old_executor = self.restoration_executor
+            
+            self.restoration_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=new_parallel,
+                thread_name_prefix='adaptive_restore_'
+            )
+            
+            # 古いエグゼキュータをシャットダウン
+            threading.Thread(
+                target=lambda: old_executor.shutdown(wait=True),
+                daemon=True
+            ).start()
+            
+            self.parallel_clips = new_parallel
+            print(f"[ADAPTIVE] 並列数調整完了: {new_parallel}workers")
     
     def stop(self):
         """最適化版の停止処理"""
@@ -747,6 +948,10 @@ class OptimizedFrameRestorer(FrameRestorer):
         
         # メモリ監視を停止
         self.memory_monitor.stop_monitoring()
+        
+        # 順序バッファをクリア（有効時のみ）
+        if self.enable_ordered_processing and self.ordered_clip_buffer:
+            self.ordered_clip_buffer.clear()
         
         # スレッドプールのシャットダウン
         if self.restoration_executor:
@@ -758,3 +963,23 @@ class OptimizedFrameRestorer(FrameRestorer):
         # 親クラスの停止処理を呼び出し
         super().stop()
         print("[OPTIMIZE-RESTORER] 停止完了")
+    
+    def get_optimization_stats(self) -> dict:
+        """最適化統計"""
+        stats = {
+            'parallel_clips': self.parallel_clips,
+            'ordered_processing_enabled': self.enable_ordered_processing,
+            'adaptive_parallel_enabled': self.enable_adaptive_parallel,
+        }
+        
+        if self.enable_adaptive_parallel and self.adaptive_optimizer:
+            stats.update(self.adaptive_optimizer.get_stats())
+        
+        if self.enable_ordered_processing and self.ordered_clip_buffer:
+            stats['ordered_buffer_size'] = len(self.ordered_clip_buffer.buffer)
+        
+        stats['queue_stats'] = {
+            'mosaic_clip_queue': self.mosaic_clip_queue.qsize(),
+        }
+        
+        return stats
