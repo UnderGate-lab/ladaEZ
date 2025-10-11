@@ -75,7 +75,7 @@ class SettingsDialog(QDialog):
         self.model_combo = QComboBox()
         self.model_combo.addItem("lada_mosaic_detection_model_v2.pt", "lada_mosaic_detection_model_v2.pt")
         self.model_combo.addItem("lada_mosaic_detection_model_v3.1_fast.pt", "lada_mosaic_detection_model_v3.1_fast.pt")
-        self.model_combo.addItem("lada_mosaic_restoration_model_generic_v1.2.pth", "lada_mosaic_restoration_model_generic_v1.2.pth")
+        self.model_combo.addItem("lada_mosaic_detection_model_v3.1_accurate.pt", "lada_mosaic_detection_model_v3.1_accurate.pt")
         
         # 現在の設定を選択
         current_model = self.settings.get('detection_model', 'lada_mosaic_detection_model_v3.1_fast.pt')
@@ -83,7 +83,7 @@ class SettingsDialog(QDialog):
         if index >= 0:
             self.model_combo.setCurrentIndex(index)
             
-        self.model_combo.setToolTip("使用するモザイク検知モデルを選択\n• v2: 基本モデル\n• v3.1_fast: 高速版\n• generic_v1.2: 汎用復元モデル")
+        self.model_combo.setToolTip("使用するモザイク検知モデルを選択\n• v2: \n• v3.1_fast: \n• v3.1_Accurate: ")
         layout.addRow("検知モデル:", self.model_combo)
         
         # RESTORER専用設定セクション
@@ -2008,7 +2008,7 @@ class LadaFinalPlayer(QMainWindow):
 
     def init_ui(self):
         """UIの初期化"""
-        self.setWindowTitle("LADA REALTIME PLAYER V1.2 - 音声同期強化版")
+        self.setWindowTitle("LADA REALTIME PLAYER V1.2")
         self.setGeometry(100, 100, 1200, 850)
         
         central = QWidget()
@@ -2157,10 +2157,10 @@ class LadaFinalPlayer(QMainWindow):
         info.setReadOnly(True)
         info.setMaximumHeight(100)
         info.setText("""
-V1.2 20251011-1 : 
+V1.2 20251011-2 : もうこれでいんじゃねバージョン
 操作: F=フルスクリーントグル | Space=再生/停止 | M=ミュートトグル | X=AI処理トグル | 進捗バークリックでシーク
 　　: S=先頭/範囲開始 | E=末尾/範囲終了 | 1-9=10%-90%移動 | Ctrl+S=範囲開始点 | Ctrl+E=範囲終了点 | Ctrl+R=範囲リセット | Ctrl+P=範囲再生モードトグル
-制限事項：頻繁にモザイク処理漏れ（並列処理の副作用、修正対応中）
+制限事項：範囲指定不具合
 """)
         layout.addWidget(info)
         
